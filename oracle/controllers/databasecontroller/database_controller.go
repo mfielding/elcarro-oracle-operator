@@ -17,6 +17,7 @@ package databasecontroller
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +28,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -53,10 +55,11 @@ var (
 // DatabaseReconciler reconciles a Database object
 type DatabaseReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	ClientFactory controllers.ConfigAgentClientFactory
-	Recorder      record.EventRecorder
+	Log                   logr.Logger
+	Scheme                *runtime.Scheme
+	Recorder              record.EventRecorder
+	InstanceLocks         *sync.Map
+	DatabaseClientFactory controllers.DatabaseClientFactory
 }
 
 func (r *DatabaseReconciler) findPod(ctx context.Context, namespace, instName string) (*corev1.PodList, error) {
@@ -106,14 +109,72 @@ func (r *DatabaseReconciler) updateIsChangeApplied(ctx context.Context, db *v1al
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get;list
 
 // Reconcile is the main method that reconciles the Database resource.
-func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctrl.Result, error) {
-	ctx := context.Background()
+func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("Database", req.NamespacedName)
+
+	var db v1alpha1.Database
+	if err := r.Get(ctx, req.NamespacedName, &db); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !db.DeletionTimestamp.IsZero() {
+		return r.ReconcileDatabaseDeletion(ctx, req, log)
+	}
+
+	return r.ReconcileDatabaseCreation(ctx, req, log)
+}
+
+func (r *DatabaseReconciler) ReconcileDatabaseDeletion(ctx context.Context, req ctrl.Request, log logr.Logger) (ctrl.Result, error) {
+
+	log.Info("reconciling Database (PDB) deletion...")
+
+	var db v1alpha1.Database
+	if err := r.Get(ctx, req.NamespacedName, &db); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Find an Instance resource that the Database belongs to.
+	var inst v1alpha1.Instance
+	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: db.Spec.Instance}, &inst); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("using the following instance to delete a database(PDB)", "db.Spec.Instance", db.Spec.Instance, "inst", inst)
+
+	if controllerutil.ContainsFinalizer(&db, controllers.FinalizerName) {
+		//delete database
+		deleteReq := controllers.DeleteDatabaseRequest{
+			Name:     db.Spec.Name,
+			DbDomain: controllers.GetDBDomain(&inst),
+		}
+
+		err := controllers.DeleteDatabase(ctx, r, r.DatabaseClientFactory, req.Namespace, inst.Name, deleteReq)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Remove PDB from list of DatabaseNames
+		if controllers.Contains(inst.Status.DatabaseNames, db.Spec.Name) {
+			log.Info("instance status  Database Names are: ", "inst.Status.DatabaseNames", inst.Status.DatabaseNames)
+			inst.Status.DatabaseNames = controllers.Filter(inst.Status.DatabaseNames, db.Spec.Name)
+		}
+		if err := r.Status().Update(ctx, &inst); err != nil {
+			log.Error(err, "failed to update an Instance status")
+			return ctrl.Result{}, err
+		}
+
+		controllerutil.RemoveFinalizer(&db, controllers.FinalizerName)
+		if err := r.Update(ctx, &db); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *DatabaseReconciler) ReconcileDatabaseCreation(ctx context.Context, req ctrl.Request, log logr.Logger) (ctrl.Result, error) {
 
 	log.Info("reconciling database")
 
 	var db v1alpha1.Database
-
 	if err := r.Get(ctx, req.NamespacedName, &db); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -127,7 +188,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: db.Spec.Instance}, &inst); err != nil {
 		return ctrl.Result{}, r.handlePreflightCheckError(ctx, &db, fmt.Errorf("failed to find instance %q for database %q", db.Spec.Instance, db.Name))
 	}
-	log.Info("found the following instance for the create a new database request", "db.Spec.Instance", db.Spec.Instance, "inst", inst)
+	log.Info("using the following instance to create a new database(PDB)", "db.Spec.Instance", db.Spec.Instance, "inst", inst)
 
 	DBDomain := controllers.GetDBDomain(&inst)
 
@@ -149,15 +210,9 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 	log.V(1).Info("a database container identified")
 
-	// svc is needed to extract the ClusterIP, which is used in all the gRPC calls.
-	svc := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: fmt.Sprintf(controllers.AgentSvcName, db.Spec.Instance), Namespace: req.NamespacedName.Namespace}, svc); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	// CDBName is specified in Instance specs
 	cdbName := inst.Spec.CDBName
-	istatus, err := CheckStatusInstanceFunc(ctx, db.Spec.Instance, cdbName, svc.Spec.ClusterIP, DBDomain, log)
+	istatus, err := CheckStatusInstanceFunc(ctx, r, r.DatabaseClientFactory, db.Spec.Instance, cdbName, inst.Namespace, "", DBDomain, log)
 	if err != nil {
 		log.Error(err, "preflight check failed", "check the database instance status", "failed")
 		return ctrl.Result{}, err
@@ -180,7 +235,16 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 	log.Info("preflight check: createDatabase external LB service is ready", "svcName", lbSvc.Name)
 
-	alreadyExists, err := NewDatabase(ctx, r, &db, svc.Spec.ClusterIP, DBDomain, cdbName, log)
+	// Add finalizer to clean up the underlying PDB in case of deletion.
+	if !controllerutil.ContainsFinalizer(&db, controllers.FinalizerName) {
+		log.Info("adding a finalizer to the Database object.")
+		controllerutil.AddFinalizer(&db, controllers.FinalizerName)
+		if err := r.Update(ctx, &db); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	alreadyExists, err := NewDatabase(ctx, r, &db, DBDomain, cdbName, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -193,7 +257,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 
 	if alreadyExists {
-		if err := SyncUsers(ctx, r, &db, svc.Spec.ClusterIP, cdbName, log); err != nil {
+		if err := SyncUsers(ctx, r, &db, cdbName, log); err != nil {
 			log.Error(err, "failed to sync database")
 			return ctrl.Result{}, err
 		}
@@ -201,7 +265,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 
 	log.V(1).Info("[DEBUG] create users", "Database", db.Spec.Name, "Users/Privs", db.Spec.Users)
-	if err := NewUsers(ctx, r, &db, svc.Spec.ClusterIP, DBDomain, cdbName, log); err != nil {
+	if err := NewUsers(ctx, r, &db, DBDomain, cdbName, log); err != nil {
 		return ctrl.Result{}, err
 	}
 

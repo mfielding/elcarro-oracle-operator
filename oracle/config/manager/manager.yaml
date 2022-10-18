@@ -28,12 +28,13 @@ spec:
         args:
         - --enable-leader-election
         image: controller:latest
+        imagePullPolicy: Always
         name: manager
         resources:
           limits:
             cpu: 100m
-            memory: 40Mi
+            memory: 60Mi
           requests:
             cpu: 100m
-            memory: 30Mi
+            memory: 50Mi
       terminationGracePeriodSeconds: 10

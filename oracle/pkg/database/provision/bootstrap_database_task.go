@@ -105,7 +105,7 @@ func (task *BootstrapTask) setParameters(ctx context.Context) error {
 	retry := 0
 	var err error
 	for ; retry < startupRetries; retry++ {
-		_, err := task.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		_, err = task.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
 			Operation:    dbdpb.BounceDatabaseRequest_STARTUP,
 			DatabaseName: task.db.GetDatabaseName(),
 			Option:       "nomount",
@@ -215,6 +215,24 @@ func (task *BootstrapTask) setupUsers(ctx context.Context) error {
 			return fmt.Errorf("creating user %s failed: %v", cu.user, err)
 		}
 		klog.InfoS("creating user done", "user", cu.user, "command", cu.cmds[1:])
+	}
+	return nil
+}
+
+// createDumpDirs creates the required adump and cdump dirs..
+func (task *BootstrapTask) createDumpDirs(ctx context.Context) error {
+	dumpDirs := []string{"adump", "cdump"}
+	var toCreate []*dbdpb.CreateDirsRequest_DirInfo
+	for _, dumpDir := range dumpDirs {
+		toCreate = append(toCreate, &dbdpb.CreateDirsRequest_DirInfo{
+			Path: fmt.Sprintf("%s/admin/%s/%s", consts.OracleBase, task.db.GetDatabaseName(), dumpDir),
+			Perm: 760,
+		})
+	}
+	if _, err := task.dbdClient.CreateDirs(ctx, &dbdpb.CreateDirsRequest{
+		Dirs: toCreate,
+	}); err != nil {
+		return fmt.Errorf("configagent/createDumpDirs: error while creating the dump dirs: %v", err)
 	}
 	return nil
 }
@@ -780,12 +798,13 @@ func NewBootstrapDatabaseTaskForUnseeded(cdbName, dbUniqueName, dbDomain string,
 		&simpleTask{name: "prepDatabase", callFun: bootstrapTask.prepDatabase},
 		&simpleTask{name: "setupUsers", callFun: bootstrapTask.setupUsers},
 		&simpleTask{name: "createPDBSeedTemp", callFun: bootstrapTask.createPDBSeedTemp},
+		&simpleTask{name: "createDumpDirs", callFun: bootstrapTask.createDumpDirs},
 	}
 	return bootstrapTask
 }
 
-// NewBootstrapDatabaseTaskForStandby returns a Task for bootstrapping a standby instance.
-func NewBootstrapDatabaseTaskForStandby(cdbName, dbDomain string, dbdClient dbdpb.DatabaseDaemonClient) *BootstrapTask {
+// NewSetupUsersTaskForStandby returns setupUsers subtask for standby instance.
+func NewSetupUsersTaskForStandby(cdbName string, dbdClient dbdpb.DatabaseDaemonClient) *BootstrapTask {
 	cdb := &oracleCDB{
 		cdbName: cdbName,
 	}

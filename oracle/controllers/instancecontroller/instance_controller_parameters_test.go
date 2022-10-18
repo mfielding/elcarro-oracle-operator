@@ -8,7 +8,7 @@ import (
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
-	pb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -61,29 +61,35 @@ func TestSanityCheckForReservedParameters(t *testing.T) {
 		},
 	}
 	ctx := context.Background()
-	fakeClientFactory := &testhelpers.FakeClientFactory{}
-	fakeClientFactory.Reset()
-	fakeConfigAgentClient := fakeClientFactory.Caclient
-	fakeConfigAgentClient.SetMethodToRespFunc(
-		map[string]func(interface{}) (interface{}, error){
-			"FetchServiceImageMetaData": func(interface{}) (interface{}, error) {
-				return &pb.FetchServiceImageMetaDataResponse{
-					Version:    "19.3",
-					CdbName:    "GCLOUD",
-					OracleHome: "/u01/app/oracle/product/19.3/db",
-				}, nil
-			},
-		},
-	)
 
+	fakeDatabaseClientFactory := &testhelpers.FakeDatabaseClientFactory{}
+	fakeDatabaseClientFactory.Reset()
+	fakeDatabaseClient := fakeDatabaseClientFactory.Dbclient
+	fakeDatabaseClient.SetMethodToResp("FetchServiceImageMetaData", &dbdpb.FetchServiceImageMetaDataResponse{
+		Version:    "19.3",
+		CdbName:    "GCLOUD",
+		OracleHome: "/u01/app/oracle/product/19.3/db",
+	})
+
+	const (
+		Namespace    = "default"
+		InstanceName = "test-instance-parameter"
+	)
+	objKey := client.ObjectKey{Namespace: Namespace, Name: InstanceName}
 	for _, tc := range tests {
-		instanceSpec := v1alpha1.InstanceSpec{
-			InstanceSpec: commonv1alpha1.InstanceSpec{
-				Parameters:        map[string]string{tc.parameterKey: tc.parameterVal},
-				MaintenanceWindow: &tc.maintenanceWindow,
+		instance := v1alpha1.Instance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      objKey.Name,
+				Namespace: objKey.Namespace,
+			},
+			Spec: v1alpha1.InstanceSpec{
+				InstanceSpec: commonv1alpha1.InstanceSpec{
+					Parameters:        map[string]string{tc.parameterKey: tc.parameterVal},
+					MaintenanceWindow: &tc.maintenanceWindow,
+				},
 			},
 		}
-		_, _, err := fetchCurrentParameterState(ctx, fakeConfigAgentClient, instanceSpec)
+		_, _, err := fetchCurrentParameterState(ctx, reconciler, fakeDatabaseClientFactory, instance)
 		if tc.expectedError && err == nil {
 			t.Fatalf("TestSanityCheckParameters(ctx) expected error for test case:%v", tc.name)
 		} else if !tc.expectedError && err != nil {
@@ -175,7 +181,7 @@ func testInstanceParameterUpdate() {
 			return instance.Status.IsChangeApplied == metav1.ConditionTrue
 		}, timeout*2, interval).Should(Equal(true))
 
-		Expect(k8sClient.Delete(ctx, &instance)).Should(Succeed())
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, &instance)
 	})
 }
 

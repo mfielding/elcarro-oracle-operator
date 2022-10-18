@@ -12,9 +12,11 @@ go_library(
         "//oracle/pkg/agents/common",
         "//oracle/pkg/agents/consts",
         "//oracle/pkg/agents/oracle",
+        "//oracle/pkg/agents/pitr",
         "//oracle/pkg/agents/security",
         "//oracle/pkg/database/lib/lro",
         "//oracle/pkg/database/provision",
+        "//oracle/pkg/util",
         "@com_github_godror_godror//:godror",
         "@com_github_golang_protobuf//ptypes:go_default_library_gen",
         "@com_github_pkg_errors//:errors",
@@ -30,13 +32,11 @@ go_library(
 
 go_test(
     name = "dbdaemon_test",
-    srcs = [
-        "dbdaemon_server_test.go",
-        "utils_test.go",
-    ],
+    srcs = ["dbdaemon_server_test.go"],
     embed = [":dbdaemon"],
     deps = [
         "//oracle/pkg/agents/oracle",
+        "//oracle/pkg/util",
         "@com_github_godror_godror//:godror",
         "@com_github_google_go_cmp//cmp",
         "@org_golang_google_grpc//:go_default_library",

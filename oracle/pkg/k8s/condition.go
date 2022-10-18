@@ -15,6 +15,7 @@
 package k8s
 
 import (
+	"strings"
 	"time"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,38 +30,43 @@ const (
 	DatabaseInstanceTimeout = "DatabaseInstanceTimeout"
 	UserReady               = "UserReady"
 	StandbyReady            = "StandbyReady"
+	PauseMode               = "Pause"
+	StandbyDRReady          = "StandbyDRReady"
 
 	// Condition Reasons
 	// Backup schedule concurrent policy is relying on the backup ready condition’s reason,
 	// BackupReady and BackupFailed means backup job is not running and scheduler will continue creating backup.
-	BackupPending                  = "BackupPending"
-	BackupReady                    = "BackupReady"
-	BackupInProgress               = "BackupInProgress"
-	BackupFailed                   = "BackupFailed"
-	CreateComplete                 = "CreateComplete"
-	CreateFailed                   = "CreateFailed"
-	CreateInProgress               = "CreateInProgress"
-	CreatePending                  = "CreatePending"
-	BootstrapPending               = "BootstrapPending"
-	BootstrapInProgress            = "BootstrapInProgress"
-	RestorePending                 = "RestorePending"
-	ImportComplete                 = "ImportComplete"
-	ImportFailed                   = "ImportFailed"
-	ImportInProgress               = "ImportInProgress"
-	ImportPending                  = "ImportPending"
-	RestoreComplete                = "RestoreComplete"
-	RestoreFailed                  = "RestoreFailed"
-	RestorePreparationInProgress   = "RestorePreparationInProgress"
-	RestorePreparationComplete     = "RestorePreparationComplete"
-	RestoreInProgress              = "RestoreInProgress"
-	PostRestoreBootstrapInProgress = "PostRestoreBootstrapInProgress"
-	SyncInProgress                 = "SyncInProgress"
-	UserOutOfSync                  = "UserOutOfSync"
-	SyncComplete                   = "SyncComplete"
-	ManuallySetUpStandbyInProgress = "ManuallySetUpStandbyInProgress"
-	PromoteStandbyInProgress       = "PromoteStandbyInProgress"
-	PromoteStandbyComplete         = "PromoteStandbyComplete"
-	PromoteStandbyFailed           = "PromoteStandbyFailed"
+	BackupPending                         = "BackupPending"
+	BackupReady                           = "BackupReady"
+	BackupInProgress                      = "BackupInProgress"
+	BackupDeleting                        = "BackupDeleting"
+	BackupFailed                          = "BackupFailed"
+	CreateComplete                        = "CreateComplete"
+	CreateFailed                          = "CreateFailed"
+	CreateInProgress                      = "CreateInProgress"
+	CreatePending                         = "CreatePending"
+	BootstrapPending                      = "BootstrapPending"
+	BootstrapInProgress                   = "BootstrapInProgress"
+	RestorePending                        = "RestorePending"
+	ImportComplete                        = "ImportComplete"
+	ImportFailed                          = "ImportFailed"
+	ImportInProgress                      = "ImportInProgress"
+	ImportPending                         = "ImportPending"
+	RestoreComplete                       = "RestoreComplete"
+	RestoreFailed                         = "RestoreFailed"
+	RestorePreparationInProgress          = "RestorePreparationInProgress"
+	RestorePreparationComplete            = "RestorePreparationComplete"
+	RestoreInProgress                     = "RestoreInProgress"
+	PostRestoreBootstrapInProgress        = "PostRestoreBootstrapInProgress"
+	PostRestoreBootstrapComplete          = "PostRestoreBootstrapComplete"
+	PostRestoreDatabasePatchingInProgress = "PostRestoreDatabasePatchingInProgress"
+	SyncInProgress                        = "SyncInProgress"
+	UserOutOfSync                         = "UserOutOfSync"
+	SyncComplete                          = "SyncComplete"
+	ManuallySetUpStandbyInProgress        = "ManuallySetUpStandbyInProgress"
+	PromoteStandbyInProgress              = "PromoteStandbyInProgress"
+	PromoteStandbyComplete                = "PromoteStandbyComplete"
+	PromoteStandbyFailed                  = "PromoteStandbyFailed"
 
 	ExportComplete   = "ExportComplete"
 	ExportFailed     = "ExportFailed"
@@ -70,7 +76,38 @@ const (
 	ParameterUpdateInProgress = "ParameterUpdateInProgress"
 	ParameterUpdateRollback   = "ParameterUpdateRollback"
 
-	NotSupported = "NotSupported"
+	StandbyDRInProgress                     = "StandbyDRInProgress"
+	StandbyDRVerifyCompleted                = "StandbyDRVerifyCompleted"
+	StandbyDRVerifyFailed                   = "StandbyDRVerifyFailed"
+	StandbyDRCreateInProgress               = "StandbyDRCreateInProgress"
+	StandbyDRCreateFailed                   = "StandbyDRCreateFailed"
+	StandbyDRCreateCompleted                = "StandbyDRCreateCompleted"
+	StandbyDRSetUpDataGuardFailed           = "StandbyDRSetUpDataGuardFailed"
+	StandbyDRSetUpDataGuardCompleted        = "StandbyDRSetUpDataGuardCompleted"
+	StandbyDRDataGuardReplicationInProgress = "StandbyDRDataGuardReplicationInProgress"
+	StandbyDRPromoteFailed                  = "StandbyDRPromoteFailed"
+	StandbyDRPromoteCompleted               = "StandbyDRPromoteCompleted"
+	StandbyDRBootstrapFailed                = "StandbyDRBootstrapFailed"
+	StandbyDRBootstrapCompleted             = "StandbyDRBootstrapCompleted"
+
+	PatchingBackupStarted      = "PatchingBackupStarted"
+	PatchingBackupCompleted    = "PatchingBackupCompleted"
+	PatchingBackupFailure      = "PatchingBackupFailure"
+	PatchingRecoveryInProgress = "PatchingRecoveryInProgress"
+	PatchingRecoveryCompleted  = "PatchingRecoveryCompleted"
+	PatchingRecoveryFailure    = "PatchingRecoveryFailure"
+
+	DeploymentSetPatchingInProgress         = "DeploymentSetPatchingInProgress"
+	DeploymentSetPatchingRollbackInProgress = "DeploymentSetPatchingRollbackInProgress"
+	DeploymentSetPatchingFailure            = "DeploymentSetPatchingFailure"
+	DeploymentSetPatchingComplete           = "DeploymentSetPatchingComplete"
+	StatefulSetPatchingInProgress           = "StatefulSetPatchingInProgress"
+	StatefulSetPatchingComplete             = "StatefulSetPatchingComplete"
+	StatefulSetPatchingFailure              = "StatefulSetPatchingFailure"
+	DatabasePatchingInProgress              = "DatabasePatchingInProgress"
+	DatabasePatchingComplete                = "DatabasePatchingComplete"
+	DatabasePatchingFailure                 = "DatabasePatchingFailure"
+	NotSupported                            = "NotSupported"
 )
 
 var (
@@ -90,6 +127,15 @@ func FindCondition(conditions []v1.Condition, name string) *v1.Condition {
 		}
 	}
 	return nil
+}
+
+func FindConditionOrFailed(conditions []v1.Condition, name string) (bool, *v1.Condition) {
+	for i, c := range conditions {
+		if c.Type == name {
+			return strings.Contains(c.Reason, "Failed"), &conditions[i]
+		}
+	}
+	return false, nil
 }
 
 func ConditionStatusEquals(cond *v1.Condition, status v1.ConditionStatus) bool {
@@ -114,11 +160,11 @@ func InstanceUpsertCondition(iStatus *v1alpha1.InstanceStatus, name string, stat
 func Upsert(conditions []v1.Condition, name string, status v1.ConditionStatus, reason, message string) []v1.Condition {
 
 	if cond := FindCondition(conditions, name); cond != nil {
-		if !ConditionStatusEquals(cond, status) { // LastTransitionTime refers to the time Status changes
+		if !ConditionStatusEquals(cond, status) || !ConditionReasonEquals(cond, reason) { // LastTransitionTime refers to the time Status changes
 			cond.Status = status
+			cond.Reason = reason
 			cond.LastTransitionTime = v1Now()
 		}
-		cond.Reason = reason
 		cond.Message = message
 		return conditions
 	}

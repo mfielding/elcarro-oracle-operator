@@ -32,6 +32,7 @@ go_library(
         "//oracle/controllers/exportcontroller",
         "//oracle/controllers/importcontroller",
         "//oracle/controllers/instancecontroller",
+        "//oracle/controllers/pitrcontroller",
         "@com_github_kubernetes_csi_external_snapshotter_v2//pkg/apis/volumesnapshot/v1beta1",
         "@io_k8s_apimachinery//pkg/api/errors",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
@@ -47,7 +48,7 @@ go_library(
 
 # Read in workspace status values to configure _push targets.
 # REGISTRY = "${PROW_IMAGE_REPO}".split("/")[0]
-REGISTRY = "gcr.io"
+REGISTRY = "{PROW_IMAGE_REPO}"
 
 # PROJECT = "${PROW_IMAGE_REPO}".split("/")[1]
 PROJECT = "{PROW_PROJECT}"
@@ -62,14 +63,14 @@ container_image(
         "@distroless//image:002.tar.gz",
         "@busybox//image:000.tar.gz",  # duplicated files will be retained from the lowest layer.
     ],
-    user = "nonroot:nonroot",
+    user = "65532:65532",  # nonroot:nonroot. Container admission tools require ids to guarentee nonroot.
     visibility = ["//visibility:public"],
 )
 
 container_image(
     name = "base_image",
     base = "@distroless//image",
-    user = "nonroot:nonroot",
+    user = "65532:65532",  # nonroot:nonroot. Container admission tools require ids to guarentee nonroot.
     visibility = ["//visibility:public"],
 )
 
@@ -88,6 +89,7 @@ container_push(
     image = ":operator_image",
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/operator",
+    stamp = "@io_bazel_rules_docker//stamp:always",
     tag = TAG,
 )
 
@@ -104,27 +106,29 @@ filegroup(
         ":package-srcs",
         "//oracle/api/v1alpha1:all-srcs",
         "//oracle/build:all-srcs",
-        "//oracle/cmd/config_agent:all-srcs",
         "//oracle/cmd/dbdaemon:all-srcs",
         "//oracle/cmd/dbdaemon_client:all-srcs",
         "//oracle/cmd/dbdaemon_proxy:all-srcs",
         "//oracle/cmd/init_oracle:all-srcs",
         "//oracle/cmd/logging:all-srcs",
         "//oracle/cmd/monitoring:all-srcs",
+        "//oracle/cmd/pitr_agent:all-srcs",
         "//oracle/controllers:all-srcs",
         "//oracle/pkg/agents/backup:all-srcs",
         "//oracle/pkg/agents/common:all-srcs",
-        "//oracle/pkg/agents/config_agent:all-srcs",
         "//oracle/pkg/agents/consts:all-srcs",
         "//oracle/pkg/agents/monitoring:all-srcs",
         "//oracle/pkg/agents/oracle:all-srcs",
+        "//oracle/pkg/agents/pitr:all-srcs",
         "//oracle/pkg/agents/security:all-srcs",
+        "//oracle/pkg/agents/standby:all-srcs",
         "//oracle/pkg/database/dbdaemon:all-srcs",
         "//oracle/pkg/database/dbdaemonproxy:all-srcs",
         "//oracle/pkg/database/lib/detach:all-srcs",
         "//oracle/pkg/database/lib/lro:all-srcs",
         "//oracle/pkg/database/provision:all-srcs",
         "//oracle/pkg/k8s:all-srcs",
+        "//oracle/pkg/util:all-srcs",
         "//oracle/scripts/manual_test:all-srcs",
     ],
     tags = ["automanaged"],

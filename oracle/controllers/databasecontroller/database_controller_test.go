@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -26,59 +27,65 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
-	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *DatabaseReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
-	DatabaseName      = testhelpers.RandName("db1")
-	Namespace         = testhelpers.RandName("ns1")
+	k8sClient                 client.Client
+	k8sManager                ctrl.Manager
+	DatabaseName              = testhelpers.RandName("db1")
+	Namespace                 = testhelpers.RandName("ns1")
+	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestDatabaseController(t *testing.T) {
 	// Mock function returns.
 	skipLBCheckForTest = true
-	CheckStatusInstanceFunc = func(ctx context.Context, instName, cdbName, clusterIP, DBDomain string, log logr.Logger) (string, error) {
+	CheckStatusInstanceFunc = func(ctx context.Context, r client.Reader, dbClientFactory controllers.DatabaseClientFactory, instName, cdbName, namespace, clusterIP, DBDomain string, log logr.Logger) (string, error) {
 		return "Ready", nil
 	}
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
+	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
 	// Run test suite for database reconciler.
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "Database controller", func() []testhelpers.Reconciler {
-		reconciler = &DatabaseReconciler{
-			Client:        k8sManager.GetClient(),
-			Log:           ctrl.Log.WithName("controllers").WithName("Database"),
-			Scheme:        k8sManager.GetScheme(),
-			ClientFactory: fakeClientFactory,
-			Recorder:      k8sManager.GetEventRecorderFor("database-controller"),
-		}
-		return []testhelpers.Reconciler{reconciler}
-	})
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t,
+		&k8sClient,
+		&k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"Database controller",
+		func() []testhelpers.Reconciler {
+			return []testhelpers.Reconciler{&DatabaseReconciler{
+				Client:                k8sManager.GetClient(),
+				Log:                   ctrl.Log.WithName("controllers").WithName("Database"),
+				Scheme:                k8sManager.GetScheme(),
+				Recorder:              k8sManager.GetEventRecorderFor("database-controller"),
+				DatabaseClientFactory: fakeDatabaseClientFactory,
+			}}
+		},
+		[]string{}, // Use default CRD locations
+	)
 }
 
 var _ = Describe("Database controller", func() {
 	// Define utility constants for object names and testing timeouts and intervals.
 	const (
-		containerDatabaseName = "oracledb"
-		instanceName          = "mydb"
-		podName               = "podname"
-		svcName               = "mydb-svc"
-		svcAgentName          = "mydb-agent-svc"
-		adminPassword         = "pwd123"
-		userName              = "joice"
-		password              = "guess"
-		privileges            = "connect"
-		timeout               = time.Second * 15
-		interval              = time.Millisecond * 15
+		instanceName  = "mydb"
+		podName       = "podname"
+		svcName       = "mydb-svc"
+		svcAgentName  = "mydb-agent-svc"
+		adminPassword = "pwd123"
+		userName      = "joice"
+		password      = "guess"
+		privileges    = "connect"
+		timeout       = time.Second * 15
+		interval      = time.Millisecond * 15
 	)
 
 	ctx := context.Background()
@@ -93,12 +100,13 @@ var _ = Describe("Database controller", func() {
 	// Currently we only have one create database tests, after each
 	// serves as finally resource clean-up.
 	AfterEach(func() {
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdInstance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdNs)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdPod)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdAgentSvc)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdSvc)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdDatabase)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: DatabaseName}, createdDatabase)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: instanceName}, createdInstance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: podName, Namespace: Namespace}, createdPod)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcAgentName, Namespace: Namespace}, createdAgentSvc)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcName, Namespace: Namespace}, createdSvc)
+		// Namespace objects can not be completely deleted in testenv.
+		testhelpers.K8sDeleteWithRetryNoWait(k8sClient, ctx, client.ObjectKey{Name: Namespace}, createdNs)
 	})
 
 	Context("Setup database with manager", func() {

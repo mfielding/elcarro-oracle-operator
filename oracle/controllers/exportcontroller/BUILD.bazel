@@ -8,7 +8,6 @@ go_library(
     deps = [
         "//oracle/api/v1alpha1",
         "//oracle/controllers",
-        "//oracle/pkg/agents/config_agent/protos",
         "//oracle/pkg/k8s",
         "@com_github_go_logr_logr//:logr",
         "@io_k8s_api//core/v1:core",
@@ -33,6 +32,7 @@ go_test(
         "@com_github_onsi_ginkgo//:ginkgo",
         "@com_github_onsi_gomega//:gomega",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
         "@io_k8s_sigs_controller_runtime//:controller-runtime",
         "@io_k8s_sigs_controller_runtime//pkg/client",
     ],

@@ -20,9 +20,8 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DatabaseDaemonClient interface {
-	// CreateDir RPC call to create a directory named path, along with any
-	// necessary parents.
-	CreateDir(ctx context.Context, in *CreateDirRequest, opts ...grpc.CallOption) (*CreateDirResponse, error)
+	// CreateDirs RPC call to create directories along with any necessary parents.
+	CreateDirs(ctx context.Context, in *CreateDirsRequest, opts ...grpc.CallOption) (*CreateDirsResponse, error)
 	// ReadDir RPC call to read the directory named by path and returns Fileinfos
 	// for the path and children.
 	ReadDir(ctx context.Context, in *ReadDirRequest, opts ...grpc.CallOption) (*ReadDirResponse, error)
@@ -44,6 +43,11 @@ type DatabaseDaemonClient interface {
 	RunRMAN(ctx context.Context, in *RunRMANRequest, opts ...grpc.CallOption) (*RunRMANResponse, error)
 	// RunRMANAsync RPC call executes Oracle's rman utility asynchronously.
 	RunRMANAsync(ctx context.Context, in *RunRMANAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
+	// RunDataGuardBroker RPC call executes Oracle's Data Guard command line
+	// utility.
+	RunDataGuard(ctx context.Context, in *RunDataGuardRequest, opts ...grpc.CallOption) (*RunDataGuardResponse, error)
+	// TNSPing RPC call executes Oracle's tnsping utility.
+	TNSPing(ctx context.Context, in *TNSPingRequest, opts ...grpc.CallOption) (*TNSPingResponse, error)
 	// NID changes a database id and/or database name.
 	NID(ctx context.Context, in *NIDRequest, opts ...grpc.CallOption) (*NIDResponse, error)
 	// GetDatabaseType returns database type(eg. ORACLE_12_2_ENTERPRISE_NONCDB)
@@ -52,9 +56,6 @@ type DatabaseDaemonClient interface {
 	GetDatabaseName(ctx context.Context, in *GetDatabaseNameRequest, opts ...grpc.CallOption) (*GetDatabaseNameResponse, error)
 	// CreatePasswordFile creates a password file for the database.
 	CreatePasswordFile(ctx context.Context, in *CreatePasswordFileRequest, opts ...grpc.CallOption) (*CreatePasswordFileResponse, error)
-	// CreateReplicaInitOraFile creates init.ora file using the template and the
-	// provided parameters.
-	CreateReplicaInitOraFile(ctx context.Context, in *CreateReplicaInitOraFileRequest, opts ...grpc.CallOption) (*CreateReplicaInitOraFileResponse, error)
 	// SetListenerRegistration sets a static listener registration and restarts
 	// the listener.
 	SetListenerRegistration(ctx context.Context, in *SetListenerRegistrationRequest, opts ...grpc.CallOption) (*BounceListenerResponse, error)
@@ -79,6 +80,9 @@ type DatabaseDaemonClient interface {
 	DataPumpImportAsync(ctx context.Context, in *DataPumpImportAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	// DataPumpExportAsync exports data to a .dmp file using expdp
 	DataPumpExportAsync(ctx context.Context, in *DataPumpExportAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
+	// ApplyDataPatchAsync applies Oracle `datapatch` utility
+	// and starts DB (CDB+PDBs) up after patching
+	ApplyDataPatchAsync(ctx context.Context, in *ApplyDataPatchAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	// ListOperations lists operations that match the specified filter in the
 	// request.
 	ListOperations(ctx context.Context, in *longrunning.ListOperationsRequest, opts ...grpc.CallOption) (*longrunning.ListOperationsResponse, error)
@@ -100,6 +104,8 @@ type DatabaseDaemonClient interface {
 	CreateFile(ctx context.Context, in *CreateFileRequest, opts ...grpc.CallOption) (*CreateFileResponse, error)
 	// BootstrapDatabase bootstraps seeded database by executing init_oracle
 	BootstrapDatabase(ctx context.Context, in *BootstrapDatabaseRequest, opts ...grpc.CallOption) (*BootstrapDatabaseResponse, error)
+	// SetDnfsState sets dNFS state
+	SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error)
 }
 
 type databaseDaemonClient struct {
@@ -110,9 +116,9 @@ func NewDatabaseDaemonClient(cc grpc.ClientConnInterface) DatabaseDaemonClient {
 	return &databaseDaemonClient{cc}
 }
 
-func (c *databaseDaemonClient) CreateDir(ctx context.Context, in *CreateDirRequest, opts ...grpc.CallOption) (*CreateDirResponse, error) {
-	out := new(CreateDirResponse)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateDir", in, out, opts...)
+func (c *databaseDaemonClient) CreateDirs(ctx context.Context, in *CreateDirsRequest, opts ...grpc.CallOption) (*CreateDirsResponse, error) {
+	out := new(CreateDirsResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateDirs", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +215,24 @@ func (c *databaseDaemonClient) RunRMANAsync(ctx context.Context, in *RunRMANAsyn
 	return out, nil
 }
 
+func (c *databaseDaemonClient) RunDataGuard(ctx context.Context, in *RunDataGuardRequest, opts ...grpc.CallOption) (*RunDataGuardResponse, error) {
+	out := new(RunDataGuardResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/RunDataGuard", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *databaseDaemonClient) TNSPing(ctx context.Context, in *TNSPingRequest, opts ...grpc.CallOption) (*TNSPingResponse, error) {
+	out := new(TNSPingResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/TNSPing", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *databaseDaemonClient) NID(ctx context.Context, in *NIDRequest, opts ...grpc.CallOption) (*NIDResponse, error) {
 	out := new(NIDResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/NID", in, out, opts...)
@@ -239,15 +263,6 @@ func (c *databaseDaemonClient) GetDatabaseName(ctx context.Context, in *GetDatab
 func (c *databaseDaemonClient) CreatePasswordFile(ctx context.Context, in *CreatePasswordFileRequest, opts ...grpc.CallOption) (*CreatePasswordFileResponse, error) {
 	out := new(CreatePasswordFileResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreatePasswordFile", in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *databaseDaemonClient) CreateReplicaInitOraFile(ctx context.Context, in *CreateReplicaInitOraFileRequest, opts ...grpc.CallOption) (*CreateReplicaInitOraFileResponse, error) {
-	out := new(CreateReplicaInitOraFileResponse)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateReplicaInitOraFile", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +350,15 @@ func (c *databaseDaemonClient) DataPumpExportAsync(ctx context.Context, in *Data
 	return out, nil
 }
 
+func (c *databaseDaemonClient) ApplyDataPatchAsync(ctx context.Context, in *ApplyDataPatchAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error) {
+	out := new(longrunning.Operation)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/ApplyDataPatchAsync", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *databaseDaemonClient) ListOperations(ctx context.Context, in *longrunning.ListOperationsRequest, opts ...grpc.CallOption) (*longrunning.ListOperationsResponse, error) {
 	out := new(longrunning.ListOperationsResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/ListOperations", in, out, opts...)
@@ -407,13 +431,21 @@ func (c *databaseDaemonClient) BootstrapDatabase(ctx context.Context, in *Bootst
 	return out, nil
 }
 
+func (c *databaseDaemonClient) SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error) {
+	out := new(SetDnfsStateResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/SetDnfsState", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DatabaseDaemonServer is the server API for DatabaseDaemon service.
 // All implementations must embed UnimplementedDatabaseDaemonServer
 // for forward compatibility
 type DatabaseDaemonServer interface {
-	// CreateDir RPC call to create a directory named path, along with any
-	// necessary parents.
-	CreateDir(context.Context, *CreateDirRequest) (*CreateDirResponse, error)
+	// CreateDirs RPC call to create directories along with any necessary parents.
+	CreateDirs(context.Context, *CreateDirsRequest) (*CreateDirsResponse, error)
 	// ReadDir RPC call to read the directory named by path and returns Fileinfos
 	// for the path and children.
 	ReadDir(context.Context, *ReadDirRequest) (*ReadDirResponse, error)
@@ -435,6 +467,11 @@ type DatabaseDaemonServer interface {
 	RunRMAN(context.Context, *RunRMANRequest) (*RunRMANResponse, error)
 	// RunRMANAsync RPC call executes Oracle's rman utility asynchronously.
 	RunRMANAsync(context.Context, *RunRMANAsyncRequest) (*longrunning.Operation, error)
+	// RunDataGuardBroker RPC call executes Oracle's Data Guard command line
+	// utility.
+	RunDataGuard(context.Context, *RunDataGuardRequest) (*RunDataGuardResponse, error)
+	// TNSPing RPC call executes Oracle's tnsping utility.
+	TNSPing(context.Context, *TNSPingRequest) (*TNSPingResponse, error)
 	// NID changes a database id and/or database name.
 	NID(context.Context, *NIDRequest) (*NIDResponse, error)
 	// GetDatabaseType returns database type(eg. ORACLE_12_2_ENTERPRISE_NONCDB)
@@ -443,9 +480,6 @@ type DatabaseDaemonServer interface {
 	GetDatabaseName(context.Context, *GetDatabaseNameRequest) (*GetDatabaseNameResponse, error)
 	// CreatePasswordFile creates a password file for the database.
 	CreatePasswordFile(context.Context, *CreatePasswordFileRequest) (*CreatePasswordFileResponse, error)
-	// CreateReplicaInitOraFile creates init.ora file using the template and the
-	// provided parameters.
-	CreateReplicaInitOraFile(context.Context, *CreateReplicaInitOraFileRequest) (*CreateReplicaInitOraFileResponse, error)
 	// SetListenerRegistration sets a static listener registration and restarts
 	// the listener.
 	SetListenerRegistration(context.Context, *SetListenerRegistrationRequest) (*BounceListenerResponse, error)
@@ -470,6 +504,9 @@ type DatabaseDaemonServer interface {
 	DataPumpImportAsync(context.Context, *DataPumpImportAsyncRequest) (*longrunning.Operation, error)
 	// DataPumpExportAsync exports data to a .dmp file using expdp
 	DataPumpExportAsync(context.Context, *DataPumpExportAsyncRequest) (*longrunning.Operation, error)
+	// ApplyDataPatchAsync applies Oracle `datapatch` utility
+	// and starts DB (CDB+PDBs) up after patching
+	ApplyDataPatchAsync(context.Context, *ApplyDataPatchAsyncRequest) (*longrunning.Operation, error)
 	// ListOperations lists operations that match the specified filter in the
 	// request.
 	ListOperations(context.Context, *longrunning.ListOperationsRequest) (*longrunning.ListOperationsResponse, error)
@@ -491,6 +528,8 @@ type DatabaseDaemonServer interface {
 	CreateFile(context.Context, *CreateFileRequest) (*CreateFileResponse, error)
 	// BootstrapDatabase bootstraps seeded database by executing init_oracle
 	BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error)
+	// SetDnfsState sets dNFS state
+	SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error)
 	mustEmbedUnimplementedDatabaseDaemonServer()
 }
 
@@ -498,8 +537,8 @@ type DatabaseDaemonServer interface {
 type UnimplementedDatabaseDaemonServer struct {
 }
 
-func (UnimplementedDatabaseDaemonServer) CreateDir(context.Context, *CreateDirRequest) (*CreateDirResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateDir not implemented")
+func (UnimplementedDatabaseDaemonServer) CreateDirs(context.Context, *CreateDirsRequest) (*CreateDirsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateDirs not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) ReadDir(context.Context, *ReadDirRequest) (*ReadDirResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReadDir not implemented")
@@ -531,6 +570,12 @@ func (UnimplementedDatabaseDaemonServer) RunRMAN(context.Context, *RunRMANReques
 func (UnimplementedDatabaseDaemonServer) RunRMANAsync(context.Context, *RunRMANAsyncRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RunRMANAsync not implemented")
 }
+func (UnimplementedDatabaseDaemonServer) RunDataGuard(context.Context, *RunDataGuardRequest) (*RunDataGuardResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunDataGuard not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) TNSPing(context.Context, *TNSPingRequest) (*TNSPingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TNSPing not implemented")
+}
 func (UnimplementedDatabaseDaemonServer) NID(context.Context, *NIDRequest) (*NIDResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method NID not implemented")
 }
@@ -542,9 +587,6 @@ func (UnimplementedDatabaseDaemonServer) GetDatabaseName(context.Context, *GetDa
 }
 func (UnimplementedDatabaseDaemonServer) CreatePasswordFile(context.Context, *CreatePasswordFileRequest) (*CreatePasswordFileResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreatePasswordFile not implemented")
-}
-func (UnimplementedDatabaseDaemonServer) CreateReplicaInitOraFile(context.Context, *CreateReplicaInitOraFileRequest) (*CreateReplicaInitOraFileResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateReplicaInitOraFile not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) SetListenerRegistration(context.Context, *SetListenerRegistrationRequest) (*BounceListenerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetListenerRegistration not implemented")
@@ -573,6 +615,9 @@ func (UnimplementedDatabaseDaemonServer) DataPumpImportAsync(context.Context, *D
 func (UnimplementedDatabaseDaemonServer) DataPumpExportAsync(context.Context, *DataPumpExportAsyncRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DataPumpExportAsync not implemented")
 }
+func (UnimplementedDatabaseDaemonServer) ApplyDataPatchAsync(context.Context, *ApplyDataPatchAsyncRequest) (*longrunning.Operation, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ApplyDataPatchAsync not implemented")
+}
 func (UnimplementedDatabaseDaemonServer) ListOperations(context.Context, *longrunning.ListOperationsRequest) (*longrunning.ListOperationsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListOperations not implemented")
 }
@@ -597,6 +642,9 @@ func (UnimplementedDatabaseDaemonServer) CreateFile(context.Context, *CreateFile
 func (UnimplementedDatabaseDaemonServer) BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BootstrapDatabase not implemented")
 }
+func (UnimplementedDatabaseDaemonServer) SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetDnfsState not implemented")
+}
 func (UnimplementedDatabaseDaemonServer) mustEmbedUnimplementedDatabaseDaemonServer() {}
 
 // UnsafeDatabaseDaemonServer may be embedded to opt out of forward compatibility for this service.
@@ -610,20 +658,20 @@ func RegisterDatabaseDaemonServer(s grpc.ServiceRegistrar, srv DatabaseDaemonSer
 	s.RegisterService(&DatabaseDaemon_ServiceDesc, srv)
 }
 
-func _DatabaseDaemon_CreateDir_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateDirRequest)
+func _DatabaseDaemon_CreateDirs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateDirsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(DatabaseDaemonServer).CreateDir(ctx, in)
+		return srv.(DatabaseDaemonServer).CreateDirs(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/agents.oracle.DatabaseDaemon/CreateDir",
+		FullMethod: "/agents.oracle.DatabaseDaemon/CreateDirs",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DatabaseDaemonServer).CreateDir(ctx, req.(*CreateDirRequest))
+		return srv.(DatabaseDaemonServer).CreateDirs(ctx, req.(*CreateDirsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -808,6 +856,42 @@ func _DatabaseDaemon_RunRMANAsync_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_RunDataGuard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunDataGuardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).RunDataGuard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/RunDataGuard",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).RunDataGuard(ctx, req.(*RunDataGuardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DatabaseDaemon_TNSPing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TNSPingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).TNSPing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/TNSPing",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).TNSPing(ctx, req.(*TNSPingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DatabaseDaemon_NID_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NIDRequest)
 	if err := dec(in); err != nil {
@@ -876,24 +960,6 @@ func _DatabaseDaemon_CreatePasswordFile_Handler(srv interface{}, ctx context.Con
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DatabaseDaemonServer).CreatePasswordFile(ctx, req.(*CreatePasswordFileRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _DatabaseDaemon_CreateReplicaInitOraFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateReplicaInitOraFileRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(DatabaseDaemonServer).CreateReplicaInitOraFile(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/agents.oracle.DatabaseDaemon/CreateReplicaInitOraFile",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DatabaseDaemonServer).CreateReplicaInitOraFile(ctx, req.(*CreateReplicaInitOraFileRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1060,6 +1126,24 @@ func _DatabaseDaemon_DataPumpExportAsync_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_ApplyDataPatchAsync_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyDataPatchAsyncRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).ApplyDataPatchAsync(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/ApplyDataPatchAsync",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).ApplyDataPatchAsync(ctx, req.(*ApplyDataPatchAsyncRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DatabaseDaemon_ListOperations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(longrunning.ListOperationsRequest)
 	if err := dec(in); err != nil {
@@ -1204,6 +1288,24 @@ func _DatabaseDaemon_BootstrapDatabase_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_SetDnfsState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetDnfsStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).SetDnfsState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/SetDnfsState",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).SetDnfsState(ctx, req.(*SetDnfsStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DatabaseDaemon_ServiceDesc is the grpc.ServiceDesc for DatabaseDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1212,8 +1314,8 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*DatabaseDaemonServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "CreateDir",
-			Handler:    _DatabaseDaemon_CreateDir_Handler,
+			MethodName: "CreateDirs",
+			Handler:    _DatabaseDaemon_CreateDirs_Handler,
 		},
 		{
 			MethodName: "ReadDir",
@@ -1256,6 +1358,14 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DatabaseDaemon_RunRMANAsync_Handler,
 		},
 		{
+			MethodName: "RunDataGuard",
+			Handler:    _DatabaseDaemon_RunDataGuard_Handler,
+		},
+		{
+			MethodName: "TNSPing",
+			Handler:    _DatabaseDaemon_TNSPing_Handler,
+		},
+		{
 			MethodName: "NID",
 			Handler:    _DatabaseDaemon_NID_Handler,
 		},
@@ -1270,10 +1380,6 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreatePasswordFile",
 			Handler:    _DatabaseDaemon_CreatePasswordFile_Handler,
-		},
-		{
-			MethodName: "CreateReplicaInitOraFile",
-			Handler:    _DatabaseDaemon_CreateReplicaInitOraFile_Handler,
 		},
 		{
 			MethodName: "SetListenerRegistration",
@@ -1312,6 +1418,10 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DatabaseDaemon_DataPumpExportAsync_Handler,
 		},
 		{
+			MethodName: "ApplyDataPatchAsync",
+			Handler:    _DatabaseDaemon_ApplyDataPatchAsync_Handler,
+		},
+		{
 			MethodName: "ListOperations",
 			Handler:    _DatabaseDaemon_ListOperations_Handler,
 		},
@@ -1342,6 +1452,10 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BootstrapDatabase",
 			Handler:    _DatabaseDaemon_BootstrapDatabase_Handler,
+		},
+		{
+			MethodName: "SetDnfsState",
+			Handler:    _DatabaseDaemon_SetDnfsState_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

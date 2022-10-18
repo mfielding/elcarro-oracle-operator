@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/klogr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	// Enable GCP auth for k8s client
@@ -67,6 +69,10 @@ var (
 
 // Initial setup before test suite.
 var _ = BeforeSuite(func() {
+	klog.SetOutput(GinkgoWriter)
+	logf.SetLogger(klogr.NewWithOptions(klogr.WithFormat(klogr.FormatKlog)))
+
+	log = logf.FromContext(nil)
 	// Note that these GSM + WI setup steps are re-runnable.
 	// If the env fulfills, no error should occur.
 
@@ -74,10 +80,10 @@ var _ = BeforeSuite(func() {
 	Expect(projectId).ToNot(BeEmpty())
 	Expect(targetCluster).ToNot(BeEmpty())
 	Expect(targetZone).NotTo(BeEmpty())
-	enableGsmApi()
-	enableIamApi()
+	testhelpers.EnableGsmApi()
+	testhelpers.EnableIamApi()
 	prepareTestUsersAndGrantAccess()
-	enableWiWithNodePool()
+	testhelpers.EnableWiWithNodePool()
 })
 
 // In case of Ctrl-C clean up the last valid k8sEnv.
@@ -103,13 +109,13 @@ var _ = Describe("User operations", func() {
 			testhelpers.CreateSimpleInstance(k8sEnv, instanceName, version, edition)
 
 			// Wait until DatabaseInstanceReady = True
-			instKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: instanceName}
+			instKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: instanceName}
 			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
 
 			// Create PDB
 			testhelpers.CreateSimplePdbWithDbObj(k8sEnv, &v1alpha1.Database{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: k8sEnv.Namespace,
+					Namespace: k8sEnv.CPNamespace,
 					Name:      databaseName,
 				},
 				Spec: v1alpha1.DatabaseSpec{
@@ -172,13 +178,13 @@ var _ = Describe("User operations", func() {
 			// Resolve password sync latency between Config Server and Oracle DB.
 			// Even after we checked PDB status is ready.
 			time.Sleep(5 * time.Second)
-			testhelpers.K8sVerifyUserConnectivity(pod, k8sEnv.Namespace, databaseName, userPwdBefore)
+			testhelpers.K8sVerifyUserConnectivity(pod, k8sEnv.CPNamespace, databaseName, userPwdBefore)
 
 			By("DB is ready, updating user secret version")
 			createdDatabase := &v1alpha1.Database{}
-			objKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: databaseName}
+			objKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: databaseName}
 
-			testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
+			testhelpers.K8sUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 				objKey,
 				createdDatabase,
 				func(obj *client.Object) {
@@ -233,7 +239,7 @@ var _ = Describe("User operations", func() {
 
 			// Verify if both PDB ready and user ready status are expected.
 			Eventually(func() metav1.ConditionStatus {
-				Expect(k8sEnv.K8sClient.Get(k8sEnv.Ctx, client.ObjectKey{Namespace: k8sEnv.Namespace, Name: databaseName}, createdDatabase)).Should(Succeed())
+				Expect(k8sEnv.K8sClient.Get(k8sEnv.Ctx, client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: databaseName}, createdDatabase)).Should(Succeed())
 				cond := k8s.FindCondition(createdDatabase.Status.Conditions, k8s.Ready)
 				syncUserCompleted := k8s.ConditionStatusEquals(&metav1.Condition{
 					Type:    k8s.UserReady,
@@ -253,13 +259,10 @@ var _ = Describe("User operations", func() {
 			time.Sleep(5 * time.Second)
 
 			By("Verify PDB user connectivity with new passwords")
-			testhelpers.K8sVerifyUserConnectivity(pod, k8sEnv.Namespace, databaseName, userPwdAfter)
+			testhelpers.K8sVerifyUserConnectivity(pod, k8sEnv.CPNamespace, databaseName, userPwdAfter)
 		})
 	}
 
-	Context("Oracle 12.2 EE", func() {
-		testUpdateUser("12.2", "EE")
-	})
 	Context("Oracle 19.3 EE", func() {
 		testUpdateUser("19.3", "EE")
 	})
@@ -267,22 +270,6 @@ var _ = Describe("User operations", func() {
 		testUpdateUser("18c", "XE")
 	})
 })
-
-func enableGsmApi() {
-	// Enable GSM API.
-	cmd := exec.Command("gcloud", "services", "enable", "secretmanager.googleapis.com")
-	out, err := cmd.CombinedOutput()
-	log.Info("gcloud services enable secretmanager.googleapis.com", "output", string(out))
-	Expect(err).NotTo(HaveOccurred())
-}
-
-func enableIamApi() {
-	// Enable IAM API.
-	cmd := exec.Command("gcloud", "services", "enable", "iamcredentials.googleapis.com")
-	out, err := cmd.CombinedOutput()
-	log.Info("gcloud services enable iamcredentials.googleapis.com", "output", string(out))
-	Expect(err).NotTo(HaveOccurred())
-}
 
 func prepareTestUsersAndGrantAccess() {
 	// Prepare test users and grant GMS permission
@@ -332,21 +319,10 @@ func prepareTestUsersAndGrantAccess() {
 		})).To(Succeed())
 	}
 }
-func enableWiWithNodePool() {
-	// Enable workload identify on existing cluster.
-	cmd := exec.Command("gcloud", "container", "clusters", "update", targetCluster, "--workload-pool="+projectId+".svc.id.goog", "--zone="+targetZone)
-	out, err := cmd.CombinedOutput()
-	log.Info("gcloud container clusters update", "output", string(out))
-	Expect(err).NotTo(HaveOccurred())
-	// Migrate applications to Workload Identity with Node pool modification.
-	cmd = exec.Command("gcloud", "container", "node-pools", "update", "default-pool", "--cluster="+targetCluster, "--workload-metadata=GKE_METADATA", "--zone="+targetZone)
-	out, err = cmd.CombinedOutput()
-	log.Info("gcloud container node-pools update", "output", string(out))
-	Expect(err).NotTo(HaveOccurred())
-}
 
 func initEnvBeforeEachTest() {
-	k8sEnv.Init(testhelpers.RandName("user-test"))
+	namespace := testhelpers.RandName("user-test")
+	k8sEnv.Init(namespace, namespace)
 	// Allow the k8s [namespace/default] service account access to GCS buckets
 	testhelpers.SetupServiceAccountBindingBetweenGcpAndK8s(k8sEnv)
 }

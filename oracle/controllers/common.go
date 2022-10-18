@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,17 +30,26 @@ import (
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 )
 
 const (
+	FinalizerName              = "oracle.db.anthosapis.com"
 	PhysBackupTimeLimitDefault = 60 * time.Minute
 	StatusReady                = "Ready"
 	StatusInProgress           = "InProgress"
 
 	RestoreInProgress = "Restore" + StatusInProgress
 	CreateInProgress  = "Create" + StatusInProgress
+
+	PITRLabel               = "pitr"
+	IncarnationLabel        = "incarnation"
+	ParentIncarnationLabel  = "parent-incarnation"
+	SCNAnnotation           = "scn"
+	TimestampAnnotation     = "timestamp"
+	DatabaseImageAnnotation = "database-image"
 )
 
 var (
@@ -62,7 +72,8 @@ var (
 	CmName = "%s-cm"
 	// DatabasePodAppLabel is the 'app' label assigned to db pod.
 	DatabasePodAppLabel = "db-op"
-	defaultDiskSpecs    = map[string]commonv1alpha1.DiskSpec{
+	// DefaultDiskSpecs is the default DiskSpec settings.
+	DefaultDiskSpecs = map[string]commonv1alpha1.DiskSpec{
 		"DataDisk": {
 			Name: "DataDisk",
 			Size: resource.MustParse("100Gi"),
@@ -76,7 +87,6 @@ var (
 			Size: resource.MustParse("100Gi"),
 		},
 	}
-
 	defaultDiskMountLocations = map[string]string{
 		"DataDisk":   "u02",
 		"LogDisk":    "u03",
@@ -114,40 +124,41 @@ type AgentDeploymentParams struct {
 	Services       []commonv1alpha1.Service
 }
 
-// ConfigAgentClientFactory is a GRPC implementation of ConfigAgentClientFactory. Exists for test mock.
-type GrpcConfigAgentClientFactory struct {
-	caclient *capb.ConfigAgentClient
-}
-
 type ConnCloseFunc func()
 
-// ConfigAgentClientFactory is a GRPC implementation of ConfigAgentClientFactory. Exists for test mock.
-type ConfigAgentClientFactory interface {
+type GRPCDatabaseClientFactory struct {
+	dbclient *dbdpb.DatabaseDaemonClient
+}
+
+// DatabaseClientFactory is a GRPC implementation of DatabaseClientFactory. Exists for test mock.
+type DatabaseClientFactory interface {
 	// New returns new Client.
 	// connection close function should be invoked by the caller if
 	// error is nil.
-	New(ctx context.Context, r client.Reader, namespace, instName string) (capb.ConfigAgentClient, ConnCloseFunc, error)
+	New(ctx context.Context, r client.Reader, namespace, instName string) (dbdpb.DatabaseDaemonClient, func() error, error)
 }
 
 // GetPVCNameAndMount returns PVC names and their corresponding mount.
 func GetPVCNameAndMount(instName, diskName string) (string, string) {
-	spec := defaultDiskSpecs[diskName]
+	spec := DefaultDiskSpecs[diskName]
 	mountLocation := defaultDiskMountLocations[spec.Name]
 	pvcName := fmt.Sprintf(PvcMountName, instName, mountLocation)
 	return pvcName, mountLocation
 }
 
-// New returns a new config agent client.
-func (g *GrpcConfigAgentClientFactory) New(ctx context.Context, r client.Reader, namespace, instName string) (capb.ConfigAgentClient, ConnCloseFunc, error) {
-	agentSvc := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: fmt.Sprintf(AgentSvcName, instName), Namespace: namespace}, agentSvc); err != nil {
+// New returns a new database daemon client
+func (d *GRPCDatabaseClientFactory) New(ctx context.Context, r client.Reader, namespace, instName string) (dbdpb.DatabaseDaemonClient, func() error, error) {
+	var dbservice = fmt.Sprintf(DbdaemonSvcName, instName)
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: dbservice, Namespace: namespace}, svc); err != nil {
 		return nil, nil, err
 	}
-	conn, err := grpc.Dial(fmt.Sprintf("%s:%d", agentSvc.Spec.ClusterIP, consts.DefaultConfigAgentPort), grpc.WithInsecure())
+
+	conn, err := common.DatabaseDaemonDialService(ctx, fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, consts.DefaultDBDaemonPort), grpc.WithBlock())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create a conn via gRPC.Dial: %w", err)
+		return nil, func() error { return nil }, err
 	}
-	return capb.NewConfigAgentClient(conn), func() { _ = conn.Close() }, nil
+	return dbdpb.NewDatabaseDaemonClient(conn), conn.Close, nil
 }
 
 // Contains check whether given "elem" presents in "array"
@@ -158,4 +169,28 @@ func Contains(array []string, elem string) bool {
 		}
 	}
 	return false
+}
+
+// Filter Returns a slice that doesn't contain element
+func Filter(slice []string, element string) []string {
+	//This implementation isn't the fastest, but it protects against slices containing a single element.
+	result := make([]string, 0, len(slice))
+	for _, s := range slice {
+		if s != element {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// GetBackupGcsPath resolves the actual gcs path based on backup spec.
+func GetBackupGcsPath(backup *v1alpha1.Backup) string {
+	gcsPath := backup.Spec.GcsPath
+	if backup.Spec.GcsDir != "" {
+		if !strings.HasSuffix(backup.Spec.GcsDir, "/") {
+			gcsPath = backup.Spec.GcsDir + "/"
+		}
+		gcsPath = gcsPath + backup.Name
+	}
+	return gcsPath
 }

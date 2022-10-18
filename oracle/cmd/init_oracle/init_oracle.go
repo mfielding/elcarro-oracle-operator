@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	bootstrapTimeout       = 19 * time.Minute
+	bootstrapTimeout       = 29 * time.Minute
 	minRequiredFreeMemInKB = 6 * 1000 * 1000 // At least 6 Gigs is required for consistently successful bootstrapping
 )
 
@@ -213,7 +213,7 @@ func main() {
 			os.Exit(consts.DefaultExitErrorCode)
 		}
 
-		klog.ErrorS(err, "CDB provisioning DONE")
+		klog.InfoS("CDB provisioning DONE")
 	}
 }
 

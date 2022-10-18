@@ -21,6 +21,19 @@ import (
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 )
 
+// This is the contract. This Backup is Anthos DB Operator compliant.
+var _ commonv1alpha1.Backup = &Backup{}
+
+// BackpSpec defines the common specifications for a Backup.
+func (i *Backup) BackupSpec() *commonv1alpha1.BackupSpec {
+	return &i.Spec.BackupSpec
+}
+
+// BackupScheduleStatus defines the common status for a BackupSchedule.
+func (i *Backup) BackupStatus() *commonv1alpha1.BackupStatus {
+	return &i.Status.BackupStatus
+}
+
 // BackupSpec defines the desired state of Backup.
 type BackupSpec struct {
 	// Backup specs that are common across all database engines.
@@ -107,6 +120,15 @@ type BackupSpec struct {
 	// +optional
 	// +kubebuilder:validation:Pattern=`^gs:\/\/.+$`
 	GcsPath string `json:"gcsPath,omitempty"`
+
+	// Similar to GcsPath but specify a Gcs directory.
+	// The backup sets of physical backup will be transferred to this GcsDir under a folder named .backup.Spec.Name.
+	// This field is usually set in .backupSchedule.Spec.backSpec to specify a GcsDir which all scheduled backups will be uploaded to.
+	// A user is to ensure proper write access to the bucket from within the
+	// Oracle Operator.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^gs:\/\/.+$`
+	GcsDir string `json:"gcsDir,omitempty"`
 }
 
 // BackupMode describes how a backup be managed by the operator.
@@ -122,9 +144,9 @@ const (
 type BackupStatus struct {
 	// Backup status that is common across all database engines.
 	commonv1alpha1.BackupStatus `json:",inline"`
-
-	BackupID   string `json:"backupid,omitempty"`
-	BackupTime string `json:"backuptime,omitempty"`
+	GcsPath                     string `json:"gcsPath,omitempty"`
+	BackupID                    string `json:"backupid,omitempty"`
+	BackupTime                  string `json:"backuptime,omitempty"`
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 	// +optional

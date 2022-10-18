@@ -17,6 +17,7 @@ package backupschedulecontroller_func_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +60,7 @@ func (f *fakeBackupReconiler) Reconcile(_ context.Context, req reconcile.Request
 		return ctrl.Result{}, nil
 	}
 	backup.Status.Conditions = k8s.Upsert(backup.Status.Conditions, k8s.Ready, v1.ConditionTrue, k8s.BackupReady, "")
+	backup.Status.Phase = commonv1alpha1.BackupSucceeded
 	if err := f.Status().Update(ctx, &backup); err != nil {
 		return reconcile.Result{}, err
 	}
@@ -70,17 +73,29 @@ func (f *fakeBackupReconiler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func TestBackupsScheduleController(t *testing.T) {
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "BackupSchedule controller", func() []testhelpers.Reconciler {
-		backupReconciler := &fakeBackupReconiler{k8sClient}
-		backupScheduleReconciler := backupschedulecontroller.NewBackupScheduleReconciler(k8sManager)
-		cronanythingReconciler, err := cronanythingcontroller.NewCronAnythingReconciler(k8sManager, ctrl.Log.WithName("controllers").WithName("CronAnything"), &cronanythingcontroller.RealCronAnythingControl{
-			Client: k8sManager.GetClient(),
-		})
-		if err != nil {
-			t.Fatalf("failed to create cronanythingcontroller for backup schedule test")
-		}
-		return []testhelpers.Reconciler{backupReconciler, backupScheduleReconciler, cronanythingReconciler}
-	})
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"BackupSchedule controller",
+		func() []testhelpers.Reconciler {
+			backupReconciler := &fakeBackupReconiler{k8sClient}
+			backupScheduleReconciler := backupschedulecontroller.NewBackupScheduleReconciler(
+				k8sManager,
+				&backupschedulecontroller.RealBackupScheduleControl{Client: k8sManager.GetClient()},
+				&cronanythingcontroller.RealCronAnythingControl{Client: k8sManager.GetClient()},
+				&backupschedulecontroller.RealBackupControl{Client: k8sManager.GetClient()},
+			)
+			instanceLocks := sync.Map{}
+			cronanythingReconciler, err := cronanythingcontroller.NewCronAnythingReconciler(k8sManager, ctrl.Log.WithName("controllers").WithName("CronAnything"), &cronanythingcontroller.RealCronAnythingControl{
+				Client: k8sManager.GetClient(),
+			}, &instanceLocks)
+			if err != nil {
+				t.Fatalf("failed to create cronanythingcontroller for backup schedule test")
+			}
+			return []testhelpers.Reconciler{backupReconciler, backupScheduleReconciler, cronanythingReconciler}
+		},
+		[]string{}, // Use default CRD locations
+	)
 }
 
 var _ = Describe("BackupSchedule controller", func() {
@@ -91,7 +106,7 @@ var _ = Describe("BackupSchedule controller", func() {
 		instanceName       = "test-instance"
 
 		timeout  = time.Second * 15
-		interval = time.Millisecond * 15
+		interval = time.Millisecond * 100
 	)
 
 	var instance v1alpha1.Instance
@@ -156,6 +171,7 @@ var _ = Describe("BackupSchedule controller", func() {
 })
 
 func testBackupCreation(namespace, backupScheduleName, instanceName string) {
+	timeout := time.Second * 20
 	By("By creating a BackupSchedule of the instance")
 	backupSchedule := &v1alpha1.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
@@ -169,26 +185,29 @@ func testBackupCreation(namespace, backupScheduleName, instanceName string) {
 					Type:     commonv1alpha1.BackupTypeSnapshot,
 				},
 			},
-			Schedule:                "* * * * *",
-			StartingDeadlineSeconds: pointer.Int64Ptr(5),
+			BackupScheduleSpec: commonv1alpha1.BackupScheduleSpec{
+				Schedule:                "*/5 * * * * *",
+				StartingDeadlineSeconds: pointer.Int64Ptr(3),
+			},
 		},
 	}
 	Expect(k8sClient.Create(context.TODO(), backupSchedule)).Should(Succeed())
 	By("Checking for the first Backup to be created")
 	Eventually(func() (int, error) {
 		return getBackupsTotal()
-	}, time.Minute*2, time.Second).Should(Equal(1))
+	}, timeout, time.Second).Should(Equal(1))
 	By("Checking for the second Backup to be created")
 	Eventually(func() (int, error) {
 		return getBackupsTotal()
-	}, time.Second*65, time.Second).Should(Equal(2))
+	}, timeout, time.Second).Should(Equal(2))
 	By("Checking for the third Backup to be created")
 	Eventually(func() (int, error) {
 		return getBackupsTotal()
-	}, time.Second*65, time.Second).Should(Equal(3))
+	}, timeout, time.Second).Should(Equal(3))
 }
 
 func testBackupRetention(namespace, backupScheduleName, instanceName string) {
+	timeout := time.Minute
 	By("By creating a BackupSchedule of the instance")
 	backupSchedule := &v1alpha1.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
@@ -202,10 +221,12 @@ func testBackupRetention(namespace, backupScheduleName, instanceName string) {
 					Type:     commonv1alpha1.BackupTypeSnapshot,
 				},
 			},
-			Schedule:                "* * * * *",
-			StartingDeadlineSeconds: pointer.Int64Ptr(5),
-			BackupRetentionPolicy: &v1alpha1.BackupRetentionPolicy{
-				BackupRetention: pointer.Int32Ptr(2),
+			BackupScheduleSpec: commonv1alpha1.BackupScheduleSpec{
+				Schedule:                "*/5 * * * * *",
+				StartingDeadlineSeconds: pointer.Int64Ptr(3),
+				BackupRetentionPolicy: &commonv1alpha1.BackupRetentionPolicy{
+					BackupRetention: pointer.Int32Ptr(2),
+				},
 			},
 		},
 	}
@@ -222,13 +243,13 @@ func testBackupRetention(namespace, backupScheduleName, instanceName string) {
 			toBeDelete = backups[0]
 		}
 		return len(backups), nil
-	}, time.Minute*2, time.Second).Should(Equal(1))
+	}, timeout, time.Second).Should(Equal(1))
 
 	By("Checking for the first Backup to be deleted")
 	Eventually(func() bool {
 		backup := &v1alpha1.Backup{}
 		return apierrors.IsNotFound(k8sClient.Get(context.TODO(), toBeDeleteKey, backup))
-	}, time.Second*200, time.Second).Should(BeTrue())
+	}, timeout, time.Second).Should(BeTrue())
 }
 
 func getBackupsTotal() (int, error) {

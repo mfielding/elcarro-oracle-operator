@@ -21,17 +21,20 @@ import (
 	"strings"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/databasecontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
+
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -76,9 +79,9 @@ func (r *InstanceReconciler) updateProgressCondition(ctx context.Context, inst v
 // TODO: add logic to handle restore/recovery
 func (r *InstanceReconciler) updateIsChangeApplied(inst *v1alpha1.Instance, log logr.Logger) {
 	if inst.Status.ObservedGeneration < inst.Generation {
+		log.Info("change detected", "observedGeneration", inst.Status.ObservedGeneration, "generation", inst.Generation)
 		inst.Status.IsChangeApplied = v1.ConditionFalse
 		inst.Status.ObservedGeneration = inst.Generation
-		log.Info("change detected", "observedGeneration", inst.Status.ObservedGeneration, "generation", inst.Generation)
 	}
 	if inst.Status.IsChangeApplied == v1.ConditionTrue {
 		return
@@ -104,8 +107,13 @@ func (r *InstanceReconciler) createStatefulSet(ctx context.Context, inst *v1alph
 	}
 	log.Info("StatefulSet constructed", "sts", sts, "sts.Status", sts.Status, "inst.Status", inst.Status)
 
-	if err := r.Patch(ctx, sts, client.Apply, applyOpts...); err != nil {
-		log.Error(err, "failed to patch the StatefulSet", "sts.Status", sts.Status)
+	baseSTS := &appsv1.StatefulSet{}
+	sts.DeepCopyInto(baseSTS)
+	if _, err := ctrl.CreateOrUpdate(ctx, r, baseSTS, func() error {
+		sts.Spec.DeepCopyInto(&baseSTS.Spec)
+		return nil
+	}); err != nil {
+		log.Error(err, "failed to create the StatefulSet", "sts.Status", sts.Status)
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -115,7 +123,7 @@ func (r *InstanceReconciler) createAgentDeployment(ctx context.Context, inst v1a
 	agentParam := controllers.AgentDeploymentParams{
 		Inst:           &inst,
 		Config:         config,
-		Scheme:         r.Scheme,
+		Scheme:         r.Scheme(),
 		Name:           fmt.Sprintf(controllers.AgentDeploymentName, inst.Name),
 		Images:         images,
 		PrivEscalation: false,
@@ -128,6 +136,9 @@ func (r *InstanceReconciler) createAgentDeployment(ctx context.Context, inst v1a
 		log.Info("createAgentDeployment: error in function NewAgentDeployment")
 		log.Error(err, "failed to create a Deployment", "agent deployment", agentDeployment)
 		return ctrl.Result{}, err
+	} else if agentDeployment == nil {
+		log.Info("createAgentDeployment: Agent Deployment not needed since it would contain no pods")
+		return ctrl.Result{}, nil
 	}
 	log.Info("createAgentDeployment: function NewAgentDeployment succeeded")
 	if err := r.Patch(ctx, agentDeployment, client.Apply, applyOpts...); err != nil {
@@ -141,57 +152,96 @@ func (r *InstanceReconciler) createAgentDeployment(ctx context.Context, inst v1a
 	return ctrl.Result{}, nil
 }
 
-func (r *InstanceReconciler) createServices(ctx context.Context, inst v1alpha1.Instance, services []string, applyOpts []client.PatchOption) (*corev1.Service, *corev1.Service, error) {
-	var svcLB *corev1.Service
-	for _, s := range services {
-		svc, err := controllers.NewSvc(&inst, r.Scheme, s)
-		if err != nil {
-			return nil, nil, err
-		}
+// CreateDBLoadBalancer returns the service for the database.
+func (r *InstanceReconciler) createDBLoadBalancer(ctx context.Context, inst *v1alpha1.Instance, applyOpts []client.PatchOption) (*corev1.Service, error) {
+	sourceCidrRanges := []string{"0.0.0.0/0"}
+	if len(inst.Spec.SourceCidrRanges) > 0 {
+		sourceCidrRanges = inst.Spec.SourceCidrRanges
+	}
+	var svcAnnotations map[string]string
 
-		if err := r.Patch(ctx, svc, client.Apply, applyOpts...); err != nil {
-			return nil, nil, err
-		}
+	lbType := corev1.ServiceTypeLoadBalancer
+	svcNameFull := fmt.Sprintf(controllers.SvcName, inst.Name)
+	svcAnnotations = utils.LoadBalancerAnnotations(inst.Spec.DBLoadBalancerOptions)
 
-		if s == "lb" {
-			svcLB = svc
-		}
+	svc := &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{Name: svcNameFull, Namespace: inst.Namespace, Annotations: svcAnnotations},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"instance": inst.Name},
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "secure-listener",
+					Protocol:   "TCP",
+					Port:       consts.SecureListenerPort,
+					TargetPort: intstr.FromInt(consts.SecureListenerPort),
+				},
+				{
+					Name:       "ssl-listener",
+					Protocol:   "TCP",
+					Port:       consts.SSLListenerPort,
+					TargetPort: intstr.FromInt(consts.SSLListenerPort),
+				},
+			},
+			Type:                     lbType,
+			LoadBalancerIP:           utils.LoadBalancerIpAddress(inst.Spec.DBLoadBalancerOptions),
+			LoadBalancerSourceRanges: sourceCidrRanges,
+		},
 	}
 
-	svc, err := controllers.NewDBDaemonSvc(&inst, r.Scheme)
+	// Set the Instance resource to own the Service resource.
+	if err := ctrl.SetControllerReference(inst, svc, r.Scheme()); err != nil {
+		return nil, err
+	}
+
+	if err := r.Patch(ctx, svc, client.Apply, applyOpts...); err != nil {
+		return nil, err
+	}
+
+	return svc, nil
+}
+
+func (r *InstanceReconciler) createDataplaneServices(ctx context.Context, inst v1alpha1.Instance, applyOpts []client.PatchOption) (dbDaemonSvc *corev1.Service, agentSvc *corev1.Service, err error) {
+	dbDaemonSvc, err = controllers.NewDBDaemonSvc(&inst, r.Scheme())
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if err := r.Patch(ctx, svc, client.Apply, applyOpts...); err != nil {
+	if err := r.Patch(ctx, dbDaemonSvc, client.Apply, applyOpts...); err != nil {
 		return nil, nil, err
 	}
 
-	svc, err = controllers.NewAgentSvc(&inst, r.Scheme)
+	agentSvc, err = controllers.NewAgentSvc(&inst, r.Scheme())
 	if err != nil {
 		return nil, nil, err
+	} else if agentSvc == nil {
+		return dbDaemonSvc, nil, nil
 	}
 
-	if err := r.Patch(ctx, svc, client.Apply, applyOpts...); err != nil {
+	if agentSvc.Spec.Ports == nil {
+		return dbDaemonSvc, agentSvc, nil
+	}
+	if err := r.Patch(ctx, agentSvc, client.Apply, applyOpts...); err != nil {
 		return nil, nil, err
 	}
-	return svcLB, svc, nil
+	return dbDaemonSvc, agentSvc, nil
 }
 
 // isImageSeeded determines from the service image metadata file if the image is seeded or unseeded.
 func (r *InstanceReconciler) isImageSeeded(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (bool, error) {
-	log.Info("isImageSeeded: new database requested", inst.GetName())
-	caClient, closeConn, err := r.ClientFactory.New(ctx, r, inst.Namespace, inst.Name)
+	log.Info("isImageSeeded: requesting image metadata...", "instance", inst.GetName())
+	dbClient, closeConn, err := r.DatabaseClientFactory.New(ctx, r, inst.GetNamespace(), inst.GetName())
+
 	if err != nil {
-		log.Error(err, "failed to create config agent client")
+		log.Error(err, "failed to create database client")
 		return false, err
 	}
 	defer closeConn()
-	serviceImageMetaData, err := caClient.FetchServiceImageMetaData(ctx, &capb.FetchServiceImageMetaDataRequest{})
+	serviceImageMetaData, err := dbClient.FetchServiceImageMetaData(ctx, &dbdpb.FetchServiceImageMetaDataRequest{})
 	if err != nil {
 		return false, fmt.Errorf("isImageSeeded: failed on FetchServiceImageMetaData call: %v", err)
 	}
-	if serviceImageMetaData.CdbName == "" {
+	if !serviceImageMetaData.SeededImage {
 		return false, nil
 	}
 	return true, nil
@@ -334,20 +384,54 @@ func (r *InstanceReconciler) statusProgress(ctx context.Context, ns, name string
 		return 85, fmt.Errorf("failed to find the right Pod %s in status Running: %s", name+"-0", foundPod.Status.Phase)
 	}
 
-	for _, c := range foundPod.Status.ContainerStatuses {
-		if c.Name == databasecontroller.DatabaseContainerName && c.Ready {
-			return 100, nil
+	for _, podCondition := range foundPod.Status.Conditions {
+		if podCondition.Type == "Ready" && podCondition.Status == "False" {
+			log.Info("statusProgress: podCondition.Type ready is False")
+			return 85, fmt.Errorf("failed to find the right Pod %s in status Running: %s", name+"-0", foundPod.Status.Phase)
+		}
+		if podCondition.Type == "ContainersReady" && podCondition.Status == "False" {
+			msg := "statusProgress: podCondition.Type ContainersReady is False"
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
 		}
 	}
-	return 85, fmt.Errorf("failed to find a database container in %+v", foundPod.Status.ContainerStatuses)
+
+	for _, c := range foundPod.Status.ContainerStatuses {
+		if !c.Ready {
+			msg := fmt.Sprintf("container %s is not ready", c.Name)
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
+		}
+		log.Info("container %s is ready", c.Name)
+	}
+	for _, c := range foundPod.Status.InitContainerStatuses {
+		if !c.Ready {
+			msg := fmt.Sprintf("init container %s is not ready", c.Name)
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
+		}
+		log.Info("container %s is ready", c.Name)
+	}
+
+	log.Info("Stateful set creation is complete")
+	return 100, nil
+}
+
+func IsPatchingStateMachineEntryCondition(enabledServices map[commonv1alpha1.Service]bool, activeImages map[string]string, spImages map[string]string, lastFailedImages map[string]string, instanceReadyCond *v1.Condition, dbInstanceCond *v1.Condition) bool {
+	if !(enabledServices[commonv1alpha1.Patching] &&
+		instanceReadyCond != nil &&
+		dbInstanceCond != nil &&
+		k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue)) {
+		return false
+	}
+	if !reflect.DeepEqual(activeImages, spImages) && (lastFailedImages == nil || !reflect.DeepEqual(lastFailedImages, spImages)) {
+		return true
+	}
+	return false
 }
 
 func (r *InstanceReconciler) isOracleUpAndRunning(ctx context.Context, inst *v1alpha1.Instance, namespace string, log logr.Logger) (bool, error) {
-	agentSvc := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: fmt.Sprintf(controllers.AgentSvcName, inst.Name), Namespace: namespace}, agentSvc); err != nil {
-		return false, err
-	}
-	status, err := CheckStatusInstanceFunc(ctx, inst.Name, inst.Spec.CDBName, agentSvc.Spec.ClusterIP, controllers.GetDBDomain(inst), log)
+	status, err := CheckStatusInstanceFunc(ctx, r, r.DatabaseClientFactory, inst.Name, inst.Spec.CDBName, inst.Namespace, "", controllers.GetDBDomain(inst), log)
 	if err != nil {
 		log.Info("dbdaemon startup still in progress, waiting")
 		return false, nil
@@ -357,4 +441,145 @@ func (r *InstanceReconciler) isOracleUpAndRunning(ctx context.Context, inst *v1a
 		return false, nil
 	}
 	return true, nil
+}
+
+func (r *InstanceReconciler) updateDatabaseIncarnationStatus(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) error {
+	incResp, err := controllers.FetchDatabaseIncarnation(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name)
+	if err != nil {
+		return fmt.Errorf("failed to fetch current database incarnation: %v", err)
+	}
+
+	if inst.Status.CurrentDatabaseIncarnation != incResp.Incarnation {
+		inst.Status.LastDatabaseIncarnation = inst.Status.CurrentDatabaseIncarnation
+	}
+	inst.Status.CurrentDatabaseIncarnation = incResp.Incarnation
+	return nil
+}
+
+func CloneMap(source map[string]string) map[string]string {
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+// Initiate a config_agent_helpers ApplyDataPatch() call
+// Create an LRO job "DatabasePatch_%s", instance.GetUID()
+// making the method idempotent (per instance)
+// Return err on failure, nil on success
+func (r *InstanceReconciler) startDatabasePatching(req ctrl.Request, ctx context.Context, inst v1alpha1.Instance, log logr.Logger) error {
+	log.Info("startDatabasePatching initiated")
+
+	// Call async ApplyDataPatch
+	log.Info("config_agent_helpers.ApplyDataPatch", "LRO", lroPatchingOperationID(inst))
+	resp, err := controllers.ApplyDataPatch(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, controllers.ApplyDataPatchRequest{
+		LroInput: &controllers.LROInput{OperationId: lroPatchingOperationID(inst)},
+	})
+	if err != nil {
+		return fmt.Errorf("failed on ApplyDataPatch gRPC call: %w", err)
+	}
+	log.Info("config_agent_helpers.ApplyDataPatch", "response", resp)
+	return nil
+}
+
+// Check for patching LRO job status
+// Return (true, nil) if job is done
+// Return (false, nil) if job still in progress
+// Return (false, err) if the job failed
+func (r *InstanceReconciler) isDatabasePatchingDone(ctx context.Context, req ctrl.Request,
+	inst v1alpha1.Instance, log logr.Logger) (bool, error) {
+
+	// Get operation id
+	id := lroPatchingOperationID(inst)
+	operation, err := controllers.GetLROOperation(ctx, r.DatabaseClientFactory, r, id, req.Namespace, inst.Name)
+	if err != nil {
+		log.Info("GetLROOperation returned error", "error", err)
+		return false, nil
+	}
+	log.Info("GetLROOperation", "response", operation)
+	if !operation.Done {
+		// Still waiting
+		return false, nil
+	}
+
+	log.Info("LRO is DONE", "id", id)
+	if err := controllers.DeleteLROOperation(ctx, r.DatabaseClientFactory, r, id, req.Namespace, inst.Name); err != nil {
+		return false, fmt.Errorf("DeleteLROOperation returned an error: %w", err)
+	}
+
+	// remote LRO completed unsuccessfully
+	if operation.GetError() != nil {
+		return false, fmt.Errorf("config_agent.ApplyDataPatch() failed: %v", operation.GetError())
+	}
+	return true, nil
+}
+
+func lroPatchingOperationID(instance v1alpha1.Instance) string {
+	return fmt.Sprintf("DatabasePatch_%s", instance.GetUID())
+}
+
+// AcquireInstanceMaintenanceLock gives caller an exclusive maintenance
+// access to the specified instance object.
+// 'inst' points to an existing instance object (will be updated after the call)
+// 'owner' identifies the owning controller e.g. 'instancecontroller'
+// Convention:
+// If the call succeeds the caller can safely assume
+// that it has exclusive access now.
+// If the call fails the caller needs to retry acquiring the lock.
+//
+// Function is idempotent, caller can acquire the lock multiple times.
+//
+// Note: The call will commit the instance object to k8s (with all changes),
+// updating the supplied 'inst' object and making all other
+// references stale.
+func AcquireInstanceMaintenanceLock(ctx context.Context, k8sClient client.Client, inst *v1alpha1.Instance, owner string) error {
+	var result error = nil
+	if inst.Status.LockedByController == "" {
+		inst.Status.LockedByController = owner
+		result = nil
+	} else if inst.Status.LockedByController == owner {
+		result = nil
+	} else {
+		result = fmt.Errorf("requested owner: %s, instance already locked by %v", owner, inst.Status.LockedByController)
+	}
+	// Will return an error if 'inst' is stale.
+	if err := k8sClient.Status().Update(ctx, inst); err != nil {
+		return fmt.Errorf("requested owner: %s, failed to update the instance status: %v", owner, err)
+	}
+	return result
+}
+
+// ReleaseInstanceMaintenanceLock releases exclusive maintenance
+// access to the specified instance object.
+// 'inst' points to an existing instance object (will be updated after the call)
+// 'owner' identifies the owning controller e.g. 'instancecontroller'
+// Convention:
+// If the call succeeds the caller can safely assume
+// that lock was released.
+// If the call fails the caller needs to retry releasing the lock.
+//
+// Call is idempotent, caller can release it multiple times.
+// If caller's not owning the lock the call will return success
+// without affecting the ownership.
+//
+// Note: The call will commit the instance object to k8s (with all changes),
+// updating the supplied 'inst' object and making all other
+// references stale.
+func ReleaseInstanceMaintenanceLock(ctx context.Context, k8sClient client.Client, inst *v1alpha1.Instance, owner string) error {
+	var result error = nil
+	if inst.Status.LockedByController == "" {
+		result = nil
+	} else if inst.Status.LockedByController == owner {
+		inst.Status.LockedByController = ""
+		result = nil
+	} else {
+		// Return success even if it's owned by someone else
+		result = nil
+	}
+	// Will return an error if 'inst' is stale.
+	if err := k8sClient.Status().Update(ctx, inst); err != nil {
+		return fmt.Errorf("requested owner: %s, failed to update the instance status: %v", owner, err)
+	}
+	return result
 }

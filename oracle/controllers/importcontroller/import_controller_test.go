@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -32,26 +33,33 @@ import (
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *ImportReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
+	k8sClient  client.Client
+	k8sManager ctrl.Manager
+	reconciler *ImportReconciler
+
+	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestImportController(t *testing.T) {
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
+	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"Import controller",
+		func() []testhelpers.Reconciler {
+			reconciler = &ImportReconciler{
+				Client:   k8sManager.GetClient(),
+				Log:      ctrl.Log.WithName("controllers").WithName("Import"),
+				Scheme:   k8sManager.GetScheme(),
+				Recorder: k8sManager.GetEventRecorderFor("import-controller"),
 
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "Import controller", func() []testhelpers.Reconciler {
-		reconciler = &ImportReconciler{
-			Client:        k8sManager.GetClient(),
-			Log:           ctrl.Log.WithName("controllers").WithName("Import"),
-			Scheme:        k8sManager.GetScheme(),
-			ClientFactory: fakeClientFactory,
-			Recorder:      k8sManager.GetEventRecorderFor("import-controller"),
-		}
+				DatabaseClientFactory: fakeDatabaseClientFactory,
+			}
 
-		return []testhelpers.Reconciler{reconciler}
-	})
+			return []testhelpers.Reconciler{reconciler}
+		},
+		[]string{}, // Use default CRD locations
+	)
 }
 
 var _ = Describe("Import controller", func() {
@@ -65,7 +73,7 @@ var _ = Describe("Import controller", func() {
 
 	ctx := context.Background()
 
-	var fakeConfigAgentClient *testhelpers.FakeConfigAgentClient
+	var fakeDatabaseClient *testhelpers.FakeDatabaseClient
 
 	var (
 		instance        *v1alpha1.Instance
@@ -110,8 +118,8 @@ var _ = Describe("Import controller", func() {
 			return k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: database.Name}, &v1alpha1.Database{})
 		}, timeout, interval).Should(Succeed())
 
-		fakeClientFactory.Reset()
-		fakeConfigAgentClient = fakeClientFactory.Caclient
+		fakeDatabaseClientFactory.Reset()
+		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 
 		// define import, expect each test case create one
 		importObjectKey = client.ObjectKey{Namespace: namespace, Name: testhelpers.RandName("import")}
@@ -153,7 +161,7 @@ var _ = Describe("Import controller", func() {
 
 		It("Should succeed when LRO completes successfully", func() {
 			By("simulating successful DataPumpImport LRO completion")
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDone)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDone)
 
 			By("creating a new import")
 			Expect(k8sClient.Create(ctx, imp)).Should(Succeed())
@@ -162,8 +170,8 @@ var _ = Describe("Import controller", func() {
 			Eventually(func() (metav1.ConditionStatus, error) {
 				return getConditionStatus(ctx, importObjectKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(metav1.ConditionTrue))
-			Eventually(fakeConfigAgentClient.DataPumpImportCalledCnt, timeout, interval).Should(Equal(1))
-			Eventually(fakeConfigAgentClient.DeleteOperationCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DataPumpImportAsyncCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 
 			readyCond, err := getCondition(ctx, importObjectKey, k8s.Ready)
 			Expect(err).ShouldNot(HaveOccurred())
@@ -172,7 +180,7 @@ var _ = Describe("Import controller", func() {
 
 		It("Should handle LRO failure", func() {
 			By("simulating failed DataPumpImport LRO completion")
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
 
 			By("creating a new import")
 			Expect(k8sClient.Create(ctx, imp)).Should(Succeed())
@@ -181,8 +189,8 @@ var _ = Describe("Import controller", func() {
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, importObjectKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.ImportFailed))
-			Eventually(fakeConfigAgentClient.DataPumpImportCalledCnt, timeout, interval).Should(Equal(1))
-			Eventually(fakeConfigAgentClient.DeleteOperationCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DataPumpImportAsyncCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 		})
 	})
 
@@ -213,7 +221,7 @@ var _ = Describe("Import controller", func() {
 
 			// give controller some time to run import if it unexpectedly is going to
 			time.Sleep(100 * time.Millisecond)
-			Expect(fakeConfigAgentClient.DataPumpImportCalledCnt()).Should(Equal(0))
+			Expect(fakeDatabaseClient.DataPumpImportAsyncCalledCnt()).Should(Equal(0))
 			Expect(getConditionReason(ctx, importObjectKey, k8s.Ready)).Should(Equal(k8s.ImportPending))
 		})
 	})

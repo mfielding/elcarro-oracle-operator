@@ -18,10 +18,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	"github.com/go-logr/logr"
-	"google.golang.org/grpc"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,7 +37,6 @@ import (
 	commonutils "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
@@ -47,10 +47,16 @@ var CheckStatusInstanceFunc = controllers.CheckStatusInstanceFunc
 type InstanceReconciler struct {
 	client.Client
 	Log           logr.Logger
-	Scheme        *runtime.Scheme
+	SchemeVal     *runtime.Scheme
 	Images        map[string]string
-	ClientFactory controllers.ConfigAgentClientFactory
 	Recorder      record.EventRecorder
+	InstanceLocks *sync.Map
+
+	DatabaseClientFactory controllers.DatabaseClientFactory
+}
+
+func (r *InstanceReconciler) Scheme() *runtime.Scheme {
+	return r.SchemeVal
 }
 
 // +kubebuilder:rbac:groups=oracle.db.anthosapis.com,resources=instances,verbs=get;list;watch;create;update;patch;delete
@@ -72,10 +78,11 @@ type InstanceReconciler struct {
 
 const (
 	physicalRestore                      = "PhysicalRestore"
-	InstanceReadyTimeout                 = 20 * time.Minute
-	DatabaseInstanceReadyTimeoutSeeded   = 20 * time.Minute
+	InstanceReadyTimeout                 = 120 * time.Minute
+	DatabaseInstanceReadyTimeoutSeeded   = 30 * time.Minute
 	DatabaseInstanceReadyTimeoutUnseeded = 60 * time.Minute // 60 minutes because it can take 50+ minutes to create an unseeded CDB
 	dateFormat                           = "20060102"
+	DefaultStsPatchingTimeout            = 25 * time.Minute
 )
 
 func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ ctrl.Result, respErr error) {
@@ -114,11 +121,27 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	instanceReadyCond := k8s.FindCondition(inst.Status.Conditions, k8s.Ready)
 	dbInstanceCond := k8s.FindCondition(inst.Status.Conditions, k8s.DatabaseInstanceReady)
 
+	if inst.Spec.Mode == commonv1alpha1.Pause {
+		if instanceReadyCond == nil || dbInstanceCond == nil || instanceReadyCond.Reason != k8s.CreateComplete {
+			log.Info("Ignoring pause mode since only instances in a stable state can be paused.")
+		} else {
+			r.InstanceLocks.Store(fmt.Sprintf("%s-%s", inst.Namespace, inst.Name), true)
+			k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.PauseMode, "Instance switched to pause mode")
+			log.Info("Instance has been set to pause for further reconciliation reset the pause mode")
+			return ctrl.Result{}, nil
+		}
+	}
+
 	var enabledServices []commonv1alpha1.Service
 	for service, enabled := range inst.Spec.Services {
 		if enabled {
 			enabledServices = append(enabledServices, service)
 		}
+	}
+
+	// If the instance is ready and DR enabled, we can set up standby DR.
+	if k8s.ConditionReasonEquals(instanceReadyCond, k8s.StandbyDRInProgress) && isStandbyDR(&inst) {
+		return r.standbyStateMachine(ctx, &inst, log)
 	}
 
 	// If the instance and database is ready, we can set the instance parameters
@@ -128,6 +151,20 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 
 		if result, err := r.setInstanceParameterStateMachine(ctx, req, inst, log); err != nil {
 			return result, err
+		}
+	}
+	// If the instance and database is ready, we can set the instance parameters
+	if k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) &&
+		k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) && (inst.Spec.EnableDnfs != inst.Status.DnfsEnabled) {
+		log.Info("instance and db is ready, modifying dNFS")
+		if err := r.setDnfs(ctx, inst, inst.Spec.EnableDnfs); err != nil {
+			return ctrl.Result{}, err
+		}
+		inst.Status.DnfsEnabled = inst.Spec.EnableDnfs
+		if inst.Status.DnfsEnabled {
+			log.Info("dNFS successfully enabled")
+		} else {
+			log.Info("dNFS successfully disabled")
 		}
 	}
 
@@ -140,20 +177,15 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		return ctrl.Result{}, err
 	}
 
-	images := make(map[string]string)
-	for k, v := range r.Images {
-		images[k] = v
-	}
+	images := CloneMap(r.Images)
 
 	if err := r.overrideDefaultImages(config, images, &inst, log); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	services := []string{"lb", "node"}
-
 	applyOpts := []client.PatchOption{client.ForceOwnership, client.FieldOwner("instance-controller")}
 
-	cm, err := controllers.NewConfigMap(&inst, r.Scheme, fmt.Sprintf(controllers.CmName, inst.Name))
+	cm, err := controllers.NewConfigMap(&inst, r.Scheme(), fmt.Sprintf(controllers.CmName, inst.Name))
 	if err != nil {
 		log.Error(err, "failed to create a ConfigMap", "cm", cm)
 		return ctrl.Result{}, err
@@ -166,7 +198,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	// Create a StatefulSet if needed.
 	sp := controllers.StsParams{
 		Inst:           &inst,
-		Scheme:         r.Scheme,
+		Scheme:         r.Scheme(),
 		Namespace:      req.NamespacedName.Namespace,
 		Images:         images,
 		SvcName:        fmt.Sprintf(controllers.SvcName, inst.Name),
@@ -177,6 +209,21 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		Config:         config,
 		Log:            log,
 		Services:       enabledServices,
+	}
+
+	if IsPatchingStateMachineEntryCondition(inst.Spec.Services, inst.Status.ActiveImages, sp.Images, inst.Status.LastFailedImages, instanceReadyCond, dbInstanceCond) ||
+		inst.Status.CurrentActiveStateMachine == "PatchingStateMachine" {
+		databasePatchingTimeout := DefaultStsPatchingTimeout
+		if inst.Spec.DatabasePatchingTimeout != nil {
+			databasePatchingTimeout = inst.Spec.DatabasePatchingTimeout.Duration
+		}
+		result, err, done := r.patchingStateMachine(req, instanceReadyCond, dbInstanceCond, &inst, ctx, &sp, config, databasePatchingTimeout, log)
+		if err != nil {
+			log.Error(err, "patchingStateMachine failed")
+		}
+		if done {
+			return result, err
+		}
 	}
 
 	// If there is a Restore section in the spec the reconciliation will be handled
@@ -196,7 +243,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 
 	if k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) && k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) {
 		log.Info("instance has already been provisioned and ready")
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.updateDatabaseIncarnationStatus(ctx, &inst, r.Log)
 	}
 
 	if result, err := r.createStatefulSet(ctx, &inst, sp, applyOpts, log); err != nil {
@@ -207,8 +254,12 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		return result, err
 	}
 
-	// Create LB/NodePort Services if needed.
-	svcLB, svc, err := r.createServices(ctx, inst, services, applyOpts)
+	dbLoadBalancer, err := r.createDBLoadBalancer(ctx, &inst, applyOpts)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	_, _, err = r.createDataplaneServices(ctx, inst, applyOpts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -218,7 +269,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	}
 
 	inst.Status.Endpoint = fmt.Sprintf(controllers.SvcEndpoint, fmt.Sprintf(controllers.SvcName, inst.Name), inst.Namespace)
-	inst.Status.URL = controllers.SvcURL(svcLB, consts.SecureListenerPort)
+	inst.Status.URL = commonutils.LoadBalancerURL(dbLoadBalancer, consts.SecureListenerPort)
 
 	// RequeueAfter 30 seconds to avoid constantly reconcile errors before statefulSet is ready.
 	// Update status when the Service is ready (for the initial provisioning).
@@ -243,7 +294,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 				r.Recorder.Eventf(&inst, corev1.EventTypeNormal, "InstanceReady", "Instance has been created successfully. Elapsed Time: %v", elapsed)
 			}
 			k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, "")
-			inst.Status.CurrentServiceImage = images["service"]
+			inst.Status.ActiveImages = CloneMap(sp.Images)
 			return ctrl.Result{}, nil
 		}
 	}
@@ -256,7 +307,12 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		}
 	}
 
-	// reach here, the instance should be ready.
+	if isStandbyDR(&inst) {
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.StandbyDRInProgress, "standby DR in progress")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// When we reach here, the instance should be ready.
 	if inst.Spec.Mode == commonv1alpha1.ManuallySetUpStandby {
 		log.Info("reconciling instance for manually set up standby: DONE")
 		// the code will return here, so we can rely on defer function to update database status.
@@ -266,16 +322,9 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	}
 
 	if k8s.ConditionStatusEquals(k8s.FindCondition(inst.Status.Conditions, k8s.StandbyReady), v1.ConditionTrue) {
-		conn, err := grpc.Dial(fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, consts.DefaultConfigAgentPort), grpc.WithInsecure())
-		if err != nil {
-			log.Error(err, "failed to create a conn via gRPC.Dial")
-			return ctrl.Result{}, err
-		}
-		defer conn.Close()
-		caClient := capb.NewConfigAgentClient(conn)
 		// promote the standby instance, bootstrap is part of promotion.
 		r.Recorder.Eventf(&inst, corev1.EventTypeNormal, k8s.PromoteStandbyInProgress, "")
-		if err := r.bootstrapStandby(ctx, &inst, caClient, log); err != nil {
+		if err := r.bootstrapStandby(ctx, &inst); err != nil {
 			r.Recorder.Eventf(&inst, corev1.EventTypeWarning, k8s.PromoteStandbyFailed, fmt.Sprintf("Error promoting standby: %v", err))
 			return ctrl.Result{}, err
 		}
@@ -284,6 +333,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		// ensure the correctness under retry.
 		r.Recorder.Eventf(&inst, corev1.EventTypeNormal, k8s.PromoteStandbyComplete, "")
 		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, "")
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
 		k8s.InstanceUpsertCondition(&inst.Status, k8s.StandbyReady, v1.ConditionFalse, k8s.PromoteStandbyComplete, "")
 		return ctrl.Result{Requeue: true}, err
 	}
@@ -385,13 +435,7 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 	switch dbInstanceCond.Reason {
 	case k8s.CreatePending:
 		// Launch the CreateCDB LRO
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, inst.Namespace, inst.Name)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-		_, err = caClient.CreateCDB(ctx, &capb.CreateCDBRequest{
+		req := &controllers.CreateCDBRequest{
 			Sid:           inst.Spec.CDBName,
 			DbUniqueName:  inst.Spec.DBUniqueName,
 			DbDomain:      controllers.GetDBDomain(inst),
@@ -400,8 +444,9 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 			//DBCA expects the parameters in the following string array format
 			// ["key1=val1", "key2=val2","key3=val3"]
 			AdditionalParams: mapsToStringArray(inst.Spec.Parameters),
-			LroInput:         &capb.LROInput{OperationId: lroCreateCDBOperationID(*inst)},
-		})
+			LroInput:         &controllers.LROInput{OperationId: lroCreateCDBOperationID(*inst)},
+		}
+		_, err = controllers.CreateCDB(ctx, r, r.DatabaseClientFactory, inst.GetNamespace(), inst.GetName(), *req)
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {
 				log.Error(err, "CreateCDB failed")
@@ -414,12 +459,12 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 	case k8s.CreateInProgress:
 		id := lroCreateCDBOperationID(*inst)
-		done, err := controllers.IsLROOperationDone(r.ClientFactory, ctx, r, inst.Namespace, id, inst.Name)
+		done, err := controllers.IsLROOperationDone(ctx, r.DatabaseClientFactory, r.Client, id, inst.GetNamespace(), inst.GetName())
 		if !done {
 			log.Info("CreateCDB still in progress, waiting")
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
-		controllers.DeleteLROOperation(r.ClientFactory, ctx, r, inst.Namespace, id, inst.Name)
+		controllers.DeleteLROOperation(ctx, r.DatabaseClientFactory, r.Client, id, inst.Namespace, inst.Name)
 		if err != nil {
 			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionFalse, k8s.CreateFailed, "CreateCDB LRO returned error")
 			log.Error(err, "CreateCDB LRO returned error")
@@ -431,24 +476,18 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 	case k8s.BootstrapPending:
 		// Launch the BootstrapDatabase LRO
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, inst.Namespace, inst.Name)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-		bootstrapMode := capb.BootstrapDatabaseRequest_ProvisionUnseeded
+		bootstrapMode := controllers.BootstrapDatabaseRequest_ProvisionUnseeded
 		if isImageSeeded {
-			bootstrapMode = capb.BootstrapDatabaseRequest_ProvisionSeeded
+			bootstrapMode = controllers.BootstrapDatabaseRequest_ProvisionSeeded
 		}
-
-		lro, err := caClient.BootstrapDatabase(ctx, &capb.BootstrapDatabaseRequest{
+		req := &controllers.BootstrapDatabaseRequest{
 			CdbName:      inst.Spec.CDBName,
 			DbUniqueName: inst.Spec.DBUniqueName,
 			Dbdomain:     controllers.GetDBDomain(inst),
 			Mode:         bootstrapMode,
-			LroInput:     &capb.LROInput{OperationId: lroBootstrapCDBOperationID(*inst)},
-		})
+			LroInput:     &controllers.LROInput{OperationId: lroBootstrapCDBOperationID(*inst)},
+		}
+		lro, err := controllers.BootstrapDatabase(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, *req)
 
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {
@@ -467,12 +506,12 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 	case k8s.BootstrapInProgress:
 		id := lroBootstrapCDBOperationID(*inst)
-		done, err := controllers.IsLROOperationDone(r.ClientFactory, ctx, r, inst.Namespace, id, inst.Name)
+		done, err := controllers.IsLROOperationDone(ctx, r.DatabaseClientFactory, r.Client, id, inst.GetNamespace(), inst.GetName())
 		if !done {
 			log.Info("BootstrapDatabase still in progress, waiting")
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
-		controllers.DeleteLROOperation(r.ClientFactory, ctx, r, inst.Namespace, id, inst.Name)
+		controllers.DeleteLROOperation(ctx, r.DatabaseClientFactory, r.Client, id, inst.Namespace, inst.Name)
 		if err != nil {
 			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionFalse, k8s.CreateFailed, "BootstrapDatabase LRO returned error")
 			log.Error(err, "BootstrapDatabase LRO returned error")
@@ -494,6 +533,41 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 	return ctrl.Result{}, nil
 }
 
+// setDnfs enables dNFS protocol in Oracle database.
+func (r *InstanceReconciler) setDnfs(ctx context.Context, inst v1alpha1.Instance, enable bool) error {
+	dbClient, closeConn, err := r.DatabaseClientFactory.New(ctx, r, inst.GetNamespace(), inst.Name)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+
+	if _, err := dbClient.SetDnfsState(ctx, &dbdpb.SetDnfsStateRequest{
+		Enable: enable,
+	}); err != nil {
+		return fmt.Errorf("error while enabling dNFS: %v", err)
+	}
+
+	_, err = dbClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
+		DatabaseName: inst.Spec.CDBName,
+		Option:       "immediate",
+	})
+	if err != nil {
+		return fmt.Errorf("BounceDatabase: error while shutting db: %v", err)
+	}
+
+	_, err = dbClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:         dbdpb.BounceDatabaseRequest_STARTUP,
+		DatabaseName:      inst.Spec.CDBName,
+		AvoidConfigBackup: false,
+	})
+	if err != nil {
+		return fmt.Errorf("dbClient/BounceDatabase: error while starting db: %v", err)
+	}
+
+	return nil
+}
+
 func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Log.V(1).Info("SetupWithManager", "images", r.Images)
 
@@ -507,4 +581,13 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&source.Kind{Type: &v1alpha1.Database{}},
 			&handler.EnqueueRequestForObject{}).
 		Complete(r)
+}
+
+func lroOperationID(opType string, instance *v1alpha1.Instance) string {
+	switch opType {
+	case physicalRestore:
+		return fmt.Sprintf("%s_%s_%s", opType, instance.GetUID(), instance.Status.LastRestoreTime.Format(time.RFC3339))
+	default:
+		return fmt.Sprintf("%s_%s", opType, instance.GetUID())
+	}
 }

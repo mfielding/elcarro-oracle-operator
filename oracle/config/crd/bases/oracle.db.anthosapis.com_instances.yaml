@@ -1,10 +1,9 @@
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.5.0
+    controller-gen.kubebuilder.io/version: v0.9.2
   creationTimestamp: null
   name: instances.oracle.db.anthosapis.com
 spec:
@@ -86,10 +85,29 @@ spec:
           spec:
             description: InstanceSpec defines the desired state of Instance.
             properties:
+              adminUser:
+                description: AdminUser represents the admin user specification
+                properties:
+                  forceResetPassword:
+                    description: ForceResetPassword defines the flag needed to reset
+                      admin user password
+                    type: boolean
+                  requestTime:
+                    description: RequestTime is a date-time to avoid triggering of
+                      a password reset repeatedly. If at least one password reset
+                      operation has occurred, any further reset operation that have
+                      RequestTime same or earlier than CreateTime will be ignored.
+                    format: date-time
+                    type: string
+                type: object
               cdbName:
-                description: CDBName is the intended name of the CDB attribute. If
+                description: 'CDBName is the intended name of the CDB attribute. If
                   the CDBName is different from the original name (with which the
-                  CDB was created) the CDB will be renamed.
+                  CDB was created) the CDB will be renamed.  The CDBName should meet
+                  Oracle SID requirements: uppercase, alphanumeric, max 8 characters,
+                  and not start with a number.'
+                maxLength: 8
+                pattern: ^[A-Z][A-Z0-9]*$
                 type: string
               characterSet:
                 description: CharacterSet used to create a database (the default is
@@ -109,6 +127,10 @@ spec:
                   a database.
                 format: int64
                 type: integer
+              databasePatchingTimeout:
+                description: Max threshold for database patching. This timeout is
+                  used independently for sts patching and OPatch/datapatch execution.
+                type: string
               databaseResources:
                 description: Resource specification for the database container. If
                   not specified, a default of 4.0Gi memory request will be used to
@@ -122,7 +144,7 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: 'Limits describes the maximum amount of compute resources
-                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                   requests:
                     additionalProperties:
@@ -134,7 +156,7 @@ spec:
                     description: 'Requests describes the minimum amount of compute
                       resources required. If Requests is omitted for a container,
                       it defaults to Limits if that is explicitly specified, otherwise
-                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/'
+                      to an implementation-defined value. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
               databaseUID:
@@ -145,20 +167,20 @@ spec:
               dbDomain:
                 description: DBDomain is an optional attribute to set a database domain.
                 type: string
-              dbNetworkServiceOptions:
+              dbLoadBalancerOptions:
                 description: DBNetworkServiceOptions allows to override some details
                   of kubernetes Service created to expose a connection to database.
                 properties:
                   gcp:
-                    description: GCP contains Google Cloud specific attributes of
-                      Service configuration.
+                    description: GCP contains Google Cloud specific attributes for
+                      the Kubernetes LoadBalancer.
                     properties:
                       loadBalancerIP:
                         description: LoadBalancerIP is a static IP address, see https://cloud.google.com/compute/docs/ip-addresses/reserve-static-external-ip-address
                         type: string
                       loadBalancerType:
-                        description: LoadBalancerType let's define a type of load
-                          balancer, see https://kubernetes.io/docs/concepts/services-networking/service/#internal-load-balancer
+                        description: A LoadBalancer can be internal or external. See
+                          https://kubernetes.io/docs/concepts/services-networking/service/#internal-load-balancer
                         enum:
                         - ""
                         - Internal
@@ -189,6 +211,12 @@ spec:
                     so that if we change a disk layout for different hosting platforms,
                     the model can be also adjusted to reflect that).
                   properties:
+                    accessModes:
+                      description: AccessModes contains the desired access modes the
+                        volume should have.
+                      items:
+                        type: string
+                      type: array
                     annotations:
                       additionalProperties:
                         type: string
@@ -203,6 +231,51 @@ spec:
                       - LogDisk
                       - BackupDisk
                       type: string
+                    selector:
+                      description: A label query over volumes to consider for binding.
+                      properties:
+                        matchExpressions:
+                          description: matchExpressions is a list of label selector
+                            requirements. The requirements are ANDed.
+                          items:
+                            description: A label selector requirement is a selector
+                              that contains values, a key, and an operator that relates
+                              the key and values.
+                            properties:
+                              key:
+                                description: key is the label key that the selector
+                                  applies to.
+                                type: string
+                              operator:
+                                description: operator represents a key's relationship
+                                  to a set of values. Valid operators are In, NotIn,
+                                  Exists and DoesNotExist.
+                                type: string
+                              values:
+                                description: values is an array of string values.
+                                  If the operator is In or NotIn, the values array
+                                  must be non-empty. If the operator is Exists or
+                                  DoesNotExist, the values array must be empty. This
+                                  array is replaced during a strategic merge patch.
+                                items:
+                                  type: string
+                                type: array
+                            required:
+                            - key
+                            - operator
+                            type: object
+                          type: array
+                        matchLabels:
+                          additionalProperties:
+                            type: string
+                          description: matchLabels is a map of {key,value} pairs.
+                            A single {key,value} in the matchLabels map is equivalent
+                            to an element of matchExpressions, whose key field is
+                            "key", the operator is "In", and the values array contains
+                            only "value". The requirements are ANDed.
+                          type: object
+                      type: object
+                      x-kubernetes-map-type: atomic
                     size:
                       anyOf:
                       - type: integer
@@ -215,6 +288,10 @@ spec:
                       description: StorageClass points to a particular CSI driver
                         and is used for disk provisioning.
                       type: string
+                    volumeName:
+                      description: VolumeName is the binding reference to the PersistentVolume
+                        tied to this disk.
+                      type: string
                   required:
                   - name
                   type: object
@@ -222,6 +299,9 @@ spec:
               edition:
                 description: Edition of a database.
                 type: string
+              enableDnfs:
+                description: EnableDnfs enables configuration of Oracle's dNFS functionality.
+                type: boolean
               hostingType:
                 description: HostingType conveys whether an Instance is meant to be
                   hosted on a cloud (single or multiple), on-prem, on Bare Metal,
@@ -272,22 +352,89 @@ spec:
                   operator.
                 enum:
                 - ManuallySetUpStandby
+                - Pause
                 type: string
               parameters:
                 additionalProperties:
                   type: string
                 description: Parameters contains the database flags in the map format
                 type: object
-              patching:
-                description: Patching contains all the patching related attributes
-                  like patch version and image.
+              replicationSettings:
+                description: ReplicationSettings provides configuration for initializing
+                  an instance as a standby for the specified primary instance. These
+                  settings can only be used when initializing an instance, adding
+                  them to an already created instance is an error. Once a standby
+                  is created with these settings you may promote the standby to its
+                  own independent instance by removing these settings. DBUniqueName
+                  must be set when initializing a standby instance.
                 properties:
-                  patchVersion:
-                    description: Patch version
+                  backupURI:
+                    description: BackupURI is the URI to a copy of the primary's RMAN
+                      backup. Standby will be created from this backup when provided.
+                      Currently only gs:// (GCS) schemes are supported.
                     type: string
-                  patchedServiceImage:
-                    description: gcr link containing the patched service image.
+                  passwordFileURI:
+                    description: PasswordFileURI is the URI to a copy of the primary's
+                      password file for establishing an active dataguard connection.
+                      Currently only gs:// (GCS) schemes are supported.
                     type: string
+                  primaryHost:
+                    description: PrimaryHost is the hostname of the primary's listener.
+                    type: string
+                  primaryPort:
+                    description: PrimaryPort is the port of the primary's listener.
+                    format: int32
+                    type: integer
+                  primaryServiceName:
+                    description: PrimaryServiceName is the service name of the primary
+                      database on the listener at PrimaryHost:PrimaryPort.
+                    type: string
+                  primaryUser:
+                    description: PrimaryUser specifies the user name and credential
+                      to authenticate to the primary database as.
+                    properties:
+                      gsmSecretRef:
+                        description: A reference to a GSM secret.
+                        properties:
+                          projectId:
+                            description: ProjectId identifies the project where the
+                              secret resource is.
+                            type: string
+                          secretId:
+                            description: SecretId identifies the secret.
+                            type: string
+                          version:
+                            description: Version is the version of the secret. If
+                              "latest" is specified, underlying the latest SecretId
+                              is used.
+                            type: string
+                        type: object
+                      name:
+                        description: Name of the User.
+                        type: string
+                      password:
+                        description: Plaintext password.
+                        type: string
+                      secretRef:
+                        description: A reference to a k8s secret.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                required:
+                - passwordFileURI
+                - primaryHost
+                - primaryPort
+                - primaryServiceName
+                - primaryUser
                 type: object
               restore:
                 description: Restore and recovery request details. This section should
@@ -329,6 +476,33 @@ spec:
                     - true
                     - false
                     type: boolean
+                  pitrRestore:
+                    description: Point In Time Recovery restore spec.
+                    properties:
+                      incarnation:
+                        description: Incarnation number to restore to. This is optional,
+                          default to current incarnation.
+                        type: string
+                      pitrRef:
+                        description: PITRRef specifies the PITR object from which
+                          to read backup data.
+                        properties:
+                          name:
+                            description: '`name` is the name of the PITR.'
+                            type: string
+                          namespace:
+                            description: '`namespace` is the namespace in which the
+                              PITR object is created.'
+                            type: string
+                        type: object
+                      scn:
+                        description: SCN to restore to.
+                        type: string
+                      timestamp:
+                        description: Timestamp to restore to.
+                        format: date-time
+                        type: string
+                    type: object
                   requestTime:
                     description: Request version as a date-time to avoid accidental
                       triggering of a restore operation when reapplying an older version
@@ -347,6 +521,12 @@ spec:
                 required:
                 - requestTime
                 type: object
+              retainDisksAfterInstanceDeletion:
+                description: RetainDisksAfterInstanceDeletion should be set to true
+                  if Persistent Volumes and underlying disks should be retained after
+                  the Instance is deleted. The Default value is false, meaning disks
+                  are deleted with the instance.
+                type: boolean
               services:
                 additionalProperties:
                   type: boolean
@@ -370,6 +550,55 @@ spec:
           status:
             description: InstanceStatus defines the observed state of Instance.
             properties:
+              ActiveImages:
+                additionalProperties:
+                  type: string
+                description: ActiveImages stores the stable images used by the active
+                  containers.
+                type: object
+              CurrentActiveStateMachine:
+                description: CurrentActiveStateMachine stores the name of the state
+                  machine currently active.
+                type: string
+              DnfsEnabled:
+                description: DnfsEnabled stores whether dNFS has already been enabled
+                  or not.
+                type: boolean
+              LastFailedImages:
+                additionalProperties:
+                  type: string
+                description: LastFailedImages stores the images which failed the last
+                  patching workflow..
+                type: object
+              adminUser:
+                description: AdminUser represents the observed state of the admin
+                  user
+                properties:
+                  createTime:
+                    description: CreateTime is the time admin user is created or last
+                      updated
+                    format: date-time
+                    type: string
+                  expireTime:
+                    description: ExpireTime is the expire time of the secret that
+                      contains admin user password
+                    format: date-time
+                    type: string
+                  secretRef:
+                    description: SecretRef is a reference to the secret that contains
+                      admin user password
+                    properties:
+                      name:
+                        description: name is unique within a namespace to reference
+                          a secret resource.
+                        type: string
+                      namespace:
+                        description: namespace defines the space within which the
+                          secret name must be unique.
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
               backupid:
                 description: Last backup ID.
                 type: string
@@ -380,13 +609,12 @@ spec:
                   description: "Condition contains details for one aspect of the current
                     state of this API Resource. --- This struct is intended for direct
                     use as an array at the field path .status.conditions.  For example,
-                    type FooStatus struct{     // Represents the observations of a
-                    foo's current state.     // Known .status.conditions.type are:
-                    \"Available\", \"Progressing\", and \"Degraded\"     // +patchMergeKey=type
-                    \    // +patchStrategy=merge     // +listType=map     // +listMapKey=type
-                    \    Conditions []metav1.Condition `json:\"conditions,omitempty\"
-                    patchStrategy:\"merge\" patchMergeKey:\"type\" protobuf:\"bytes,1,rep,name=conditions\"`
-                    \n     // other fields }"
+                    type FooStatus struct{ // Represents the observations of a foo's
+                    current state. // Known .status.conditions.type are: \"Available\",
+                    \"Progressing\", and \"Degraded\" // +patchMergeKey=type // +patchStrategy=merge
+                    // +listType=map // +listMapKey=type Conditions []metav1.Condition
+                    `json:\"conditions,omitempty\" patchStrategy:\"merge\" patchMergeKey:\"type\"
+                    protobuf:\"bytes,1,rep,name=conditions\"` \n // other fields }"
                   properties:
                     lastTransitionTime:
                       description: lastTransitionTime is the last time the condition
@@ -447,16 +675,110 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              currentDatabaseIncarnation:
+                description: CurrentDatabaseIncarnation stores the current incarnation
+                  number
+                type: string
               currentParameters:
                 additionalProperties:
                   type: string
                 description: CurrentParameters stores the last successfully set instance
                   parameters.
                 type: object
-              currentServiceImage:
-                description: CurrentServiceImage stores the image name used by the
-                  database instance.
-                type: string
+              currentReplicationSettings:
+                description: CurrentReplicationSettings stores the current replication
+                  settings of the standby instance. Standby data replication uses
+                  it to promote a standby instance. It will be updated to match with
+                  spec.replicationSettings before promotion. It will be removed once
+                  data replication is completed.
+                properties:
+                  backupURI:
+                    description: BackupURI is the URI to a copy of the primary's RMAN
+                      backup. Standby will be created from this backup when provided.
+                      Currently only gs:// (GCS) schemes are supported.
+                    type: string
+                  passwordFileURI:
+                    description: PasswordFileURI is the URI to a copy of the primary's
+                      password file for establishing an active dataguard connection.
+                      Currently only gs:// (GCS) schemes are supported.
+                    type: string
+                  primaryHost:
+                    description: PrimaryHost is the hostname of the primary's listener.
+                    type: string
+                  primaryPort:
+                    description: PrimaryPort is the port of the primary's listener.
+                    format: int32
+                    type: integer
+                  primaryServiceName:
+                    description: PrimaryServiceName is the service name of the primary
+                      database on the listener at PrimaryHost:PrimaryPort.
+                    type: string
+                  primaryUser:
+                    description: PrimaryUser specifies the user name and credential
+                      to authenticate to the primary database as.
+                    properties:
+                      gsmSecretRef:
+                        description: A reference to a GSM secret.
+                        properties:
+                          projectId:
+                            description: ProjectId identifies the project where the
+                              secret resource is.
+                            type: string
+                          secretId:
+                            description: SecretId identifies the secret.
+                            type: string
+                          version:
+                            description: Version is the version of the secret. If
+                              "latest" is specified, underlying the latest SecretId
+                              is used.
+                            type: string
+                        type: object
+                      name:
+                        description: Name of the User.
+                        type: string
+                      password:
+                        description: Plaintext password.
+                        type: string
+                      secretRef:
+                        description: A reference to a k8s secret.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                required:
+                - passwordFileURI
+                - primaryHost
+                - primaryPort
+                - primaryServiceName
+                - primaryUser
+                type: object
+              dataGuardOutput:
+                description: DataGuardOutput stores the latest Data Guard utility
+                  status output.
+                properties:
+                  lastUpdateTime:
+                    description: LastUpdateTime is the last time the DataGuardOutput
+                      updated based on DB Data Guard utility output.
+                    format: date-time
+                    type: string
+                  statusOutput:
+                    description: StatusOutput is the output of "show configuration"
+                      and "show database <standby DB unique name>".
+                    items:
+                      type: string
+                    type: array
+                required:
+                - lastUpdateTime
+                - statusOutput
+                type: object
               databasenames:
                 description: List of database names (e.g. PDBs) hosted in the Instance.
                 items:
@@ -474,6 +796,10 @@ spec:
                 description: IsChangeApplied indicates whether instance changes have
                   been applied
                 type: string
+              lastDatabaseIncarnation:
+                description: LastDatabaseIncarnation stores the parent incarnation
+                  number
+                type: string
               lastFailedParameterUpdate:
                 additionalProperties:
                   type: string
@@ -482,6 +808,12 @@ spec:
                 type: object
               lastRestoreTime:
                 format: date-time
+                type: string
+              lockedBy:
+                description: LockedByController is a shared lock field granting exclusive
+                  access to maintenance operations to only one controller. Empty value
+                  means unlocked. Non-empty value contains the name of the owning
+                  controller.
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the latest generation observed
@@ -501,9 +833,3 @@ spec:
     storage: true
     subresources:
       status: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

@@ -23,10 +23,7 @@ bazel_noui=--ui_event_filters=-INFO --noshow_loading_progress --show_result=0
 KUSTOMIZE=bazel run --run_under="cd $$PWD &&" $(bazel_noui) -- //:kustomize
 
 export PROW_IMAGE_REPO ?= $(shell\
-	if [ -n "${PROW_JOB_ID}" ]; then \
-		echo "gcr.io/prow-build-graybox"; \
-	else echo "gcr.io/${USER}-playground-operator"; \
-	fi \
+	echo "gcr.io"; \
 )
 # Prefer Louhi refSha, then check for general prow, finally assume dev.
 export PROW_IMAGE_TAG ?= $(shell\
@@ -72,6 +69,13 @@ export PROW_INT_TEST_SA=$(shell\
 	fi \
 )
 
+# Define number of bazel test jobs for integration tests
+# Chosen arbitrarily, up to total number of jobs
+export INT_TEST_PARALLEL_JOBS=11
+# Define number of integration test cluster nodes = INT_TEST_PARALLEL_JOBS x 2
+# as each job can use up to 2 nodes
+export INT_TEST_CLUSTER_NODE_COUNT=22
+
 env:
 	@echo "export PROW_IMAGE_REPO=${PROW_IMAGE_REPO}"
 	@echo "export PROW_IMAGE_TAG=${PROW_IMAGE_TAG}"
@@ -94,18 +98,24 @@ unit-test:
 test:
 	rm -f failed # clear any old flags
 	# Unit/Functional tests, unlimited jobs
-	bazel test --test_output=errors --test_tag_filters="-integration" ... || touch failed
+	bazel test \
+	  --test_output=errors \
+	  --test_tag_filters="-integration" \
+	  --@io_bazel_rules_go//go/config:race \
+	  ... || touch failed
 	# Load oracle image paths from env variables to .bazelrc
 	envsubst < controllers/inttest/.bazelrc.tmpl > controllers/inttest/.bazelrc
 	# Integration tests, build unlimited, but limit test jobs.
-	bazel build --test_tag_filters="integration" ... || touch failed
+	bazel build --@io_bazel_rules_go//go/config:race --test_tag_filters="integration" ... || touch failed
 	bazel \
 		--bazelrc=controllers/inttest/.bazelrc \
 		test \
- 		--jobs=10 \
- 		--local_cpu_resources=10 \
- 		--test_tag_filters="integration" \
- 		... \
+		--jobs=${INT_TEST_PARALLEL_JOBS} \
+		--local_cpu_resources=${INT_TEST_PARALLEL_JOBS} \
+		--test_tag_filters="integration" \
+		--@io_bazel_rules_go//go/config:race \
+		--test_timeout=60,300,900,7200 \
+		... \
 		--test_output=errors \
 		--spawn_strategy=local \
 		--genrule_strategy=local \
@@ -113,9 +123,10 @@ test:
 		--test_env=PROW_IMAGE_TAG=${PROW_IMAGE_TAG} \
 		--test_env=PROW_PROJECT=${PROW_PROJECT} \
 		--test_env=PROW_CLUSTER=${PROW_CLUSTER} \
+		--test_env=PROW_CANARY_JOB=${PROW_CANARY_JOB} \
 		--test_env=PROW_INT_TEST_SA=${PROW_INT_TEST_SA} \
-		--test_env=ARTIFACTS=${ARTIFACTS} \
-		--test_env=PROW_CLUSTER_ZONE=${PROW_CLUSTER_ZONE} || touch failed
+		--test_env=PROW_CLUSTER_ZONE=${PROW_CLUSTER_ZONE} \
+		--test_env=ARTIFACTS=${ARTIFACTS} || touch failed
 	if [[ -n "$$ARTIFACTS" ]]; then find ../bazel-testlogs/ -name '*.xml' -o -name '*.log' | xargs cp --parents -t "$$ARTIFACTS/" ; fi
 	if [[ -f "failed" ]]; then rm failed; exit 100; fi
 
@@ -159,8 +170,8 @@ buildah-push-operator:
 buildah-push-dbinit:
 	bazel run //oracle/build:dbinit_push
 
-buildah-push-configagent:
-	bazel run //oracle/build:configagent_push
+buildah-push-pitragent:
+	bazel run //oracle/build:pitragent_push
 
 buildah-push-dbdaemon-client:
 	bazel run //oracle/build:dbdaemonclient_push
@@ -172,7 +183,7 @@ buildah-push-monitoring:
 	bazel run //oracle/build:monitoring_push
 
 # Build and push everything except the db image for integration tests.
-buildah-push-all: buildah-push-operator buildah-push-dbinit buildah-push-configagent buildah-push-logging buildah-push-monitoring
+buildah-push-all: buildah-push-operator buildah-push-dbinit buildah-push-logging buildah-push-monitoring buildah-push-pitragent
 
 # Install CRDs into a cluster
 install: generate-config
@@ -184,9 +195,40 @@ uninstall: generate-config
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 deploy: generate-config
-	$(MAKE) buildah-push-all -j8
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${PROW_IMAGE_REPO}/oracle.db.anthosapis.com/operator:${PROW_IMAGE_TAG}
+	$(MAKE) buildah-push-all-containerized -j8
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${PROW_IMAGE_REPO}/${PROW_PROJECT}/oracle.db.anthosapis.com/operator:${PROW_IMAGE_TAG}
 	$(KUSTOMIZE) build config/default | kubectl apply -f -
+
+# In case your native environment's abi is incompatible with OEL8 (GLIBC errors)
+# this will take you into a build environment similar to our CI
+# where you can build with abi compatibility. With podman we could use --env-host
+dev-container:
+	env | grep -v '^HOME\|^XDG\|^TMP\|^PATH\|^USER' > /tmp/env_host
+	docker run --rm -it --entrypoint="" \
+		--env-file=/tmp/env_host \
+		--env PATH="/go/bin:/usr/local/go/bin:/google-cloud-sdk/bin:/workspace:${PATH}" \
+		--mount=type=bind,src=$(shell readlink -f ../),dst=/workspace/code \
+		--mount=type=bind,src=$(shell readlink -f ~/.cache/bazel),dst=/root/.cache/bazel \
+		--mount=type=bind,src=$(shell readlink -f ~/.config/),dst=/root/.config/ \
+		gcr.io/k8s-testimages/kubekins-e2e:latest-master \
+		/bin/sh -c "/workspace/code/oracle/scripts/install_prow_deps.sh && gcloud container clusters get-credentials --zone=${PROW_CLUSTER_ZONE} ${PROW_CLUSTER} && cd /workspace/code/oracle && /bin/bash"
+
+# Instead of entering the dev-container just build and push containers.  We
+# only call gcloud auth configure-docker instead of the full install steps
+# since we wont be running formatting and verification here and it makes the
+# container startup much faster.  This must also cleanup the bazel-* symlinks
+# which will get overwritten in the host.
+buildah-push-all-containerized:
+	env | grep -v '^HOME\|^XDG\|^TMP\|^PATH\|^USER' > /tmp/env_host
+	docker run --rm -it --entrypoint="" \
+		--env-file=/tmp/env_host \
+		--env PATH="/go/bin:/usr/local/go/bin:/google-cloud-sdk/bin:/workspace:${PATH}" \
+		--mount=type=bind,src=$(shell readlink -f ../),dst=/workspace/code \
+		--mount=type=bind,src=$(shell readlink -f ~/.cache/bazel),dst=/root/.cache/bazel \
+		--mount=type=bind,src=$(shell readlink -f ~/.config/),dst=/root/.config/ \
+		gcr.io/k8s-testimages/kubekins-e2e:latest-master \
+		/bin/sh -c "gcloud auth configure-docker --quiet && /workspace/code/oracle/scripts/install_prow_deps.sh && cd /workspace/code/oracle && make buildah-push-all && rm /workspace/code/bazel-*"
+
 
 # Install all the required dependencies for prow.
 prepare-prow:
@@ -202,8 +244,8 @@ operator-presubmit: prepare-prow
 	$(MAKE) -j8 buildah-push-all
 	# Remove stale resources from the project
 	scripts/integration_test_cluster/cleanup_integration_test_clusters.sh
-	# Create a new GKE cluster for int tests
-	scripts/integration_test_cluster/create_integration_test_cluster.sh
+	# Create a new GKE cluster for int tests (can be flaky, if failed retry this step once more)
+	scripts/integration_test_cluster/create_integration_test_cluster.sh || (echo "*** Deleting the cluster and trying to create once more *** "; scripts/integration_test_cluster/delete_integration_test_cluster.sh || true; scripts/integration_test_cluster/create_integration_test_cluster.sh)
 	# Run tests, remove temp cluster in case of failure
 	$(MAKE) test || (scripts/integration_test_cluster/delete_integration_test_cluster.sh; exit 100)
 	# Delete the GKE cluster
@@ -212,7 +254,8 @@ operator-presubmit: prepare-prow
 # Prow canary test job entry point: operator-canary
 operator-canary: prepare-prow
 	scripts/canary_build_dbimage_image_build.sh
-	$(MAKE) operator-presubmit
+	# Let the tests know they are in the canary job
+	export PROW_CANARY_JOB=true; $(MAKE) operator-presubmit
 
 # Github presubmit Prow job entry point
 operator-oss-presubmit: prepare-prow
@@ -223,8 +266,8 @@ operator-oss-presubmit: prepare-prow
 louhi-operator-canary: prepare-prow
 	# Remove stale clusters from the project
 	scripts/integration_test_cluster/cleanup_integration_test_clusters.sh
-	# Create a new GKE cluster for int tests (can also be flaky, retry this step once more)
-	scripts/integration_test_cluster/create_integration_test_cluster.sh || (echo "*** Retrying cluster creation ***"; scripts/integration_test_cluster/create_integration_test_cluster.sh)
+	# Create a new GKE cluster for int tests (can be flaky, if failed retry this step once more)
+	scripts/integration_test_cluster/create_integration_test_cluster.sh || (echo "*** Deleting the cluster and trying to create once more ***"; scripts/integration_test_cluster/delete_integration_test_cluster.sh || true; scripts/integration_test_cluster/create_integration_test_cluster.sh)
 	# Run tests, remove temp cluster in case of failure
 	$(MAKE) test || (scripts/integration_test_cluster/delete_integration_test_cluster.sh; exit 100)
 	# Delete the GKE cluster
@@ -241,7 +284,6 @@ prepare-release:
 	sed -i "s/operator:latest/operator:${RELEASE_NAME}/g" operator.yaml
 	echo "updating image tags for main.go..."
 	sed -i "s/dbinit:latest/dbinit:${RELEASE_NAME}/g" main.go
-	sed -i "s/configagent:latest/configagent:${RELEASE_NAME}/g" main.go
 	sed -i "s/monitoring:latest/monitoring:${RELEASE_NAME}/g" main.go
 	sed -i "s/loggingsidecar:latest/loggingsidecar:${RELEASE_NAME}/g" main.go
 

@@ -64,7 +64,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 	BeforeEach(func() {
 		defer GinkgoRecover()
 		namespace = testhelpers.RandName("physical-backup-test")
-		k8sEnv.Init(namespace)
+		k8sEnv.Init(namespace, namespace)
 
 		// Allow the k8s [namespace/default] service account access to GCS buckets
 		testhelpers.SetupServiceAccountBindingBetweenGcpAndK8s(k8sEnv)
@@ -130,7 +130,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 
 				By("By restoring an instance from backup")
 				instKey = client.ObjectKey{Namespace: namespace, Name: tc.instanceName}
-				testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
+				testhelpers.K8sUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 					instKey,
 					instance,
 					func(obj *client.Object) {
@@ -175,6 +175,9 @@ var _ = Describe("Instance and Database provisioning", func() {
 					},
 					Images:            map[string]string{},
 					DatabaseResources: dbResource,
+					DBLoadBalancerOptions: &commonv1alpha1.DBLoadBalancerOptions{
+						GCP: commonv1alpha1.DBLoadBalancerOptionsGCP{LoadBalancerType: "Internal"},
+					},
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -185,13 +188,6 @@ var _ = Describe("Instance and Database provisioning", func() {
 			},
 		}
 
-		Context("Oracle 12.2 EE", func() {
-			testCase.instanceSpec.Version = "12.2"
-			testCase.instanceSpec.Images = map[string]string{
-				"service": testhelpers.TestImageForVersion("12.2", "EE", ""),
-			}
-			BackupTest(testCase)
-		})
 		Context("Oracle 18c XE", func() {
 			testCase.instanceSpec.Version = "18c"
 			testCase.instanceSpec.Images = map[string]string{
@@ -226,6 +222,9 @@ var _ = Describe("Instance and Database provisioning", func() {
 					},
 					Images:            map[string]string{},
 					DatabaseResources: dbResource,
+					DBLoadBalancerOptions: &commonv1alpha1.DBLoadBalancerOptions{
+						GCP: commonv1alpha1.DBLoadBalancerOptionsGCP{LoadBalancerType: "Internal"},
+					},
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -236,13 +235,6 @@ var _ = Describe("Instance and Database provisioning", func() {
 				LocalPath: "/u04/app/oracle/rman",
 			},
 		}
-		Context("Oracle 12.2 EE", func() {
-			testCase.instanceSpec.Version = "12.2"
-			testCase.instanceSpec.Images = map[string]string{
-				"service": testhelpers.TestImageForVersion("12.2", "EE", ""),
-			}
-			BackupTest(testCase)
-		})
 		Context("Oracle 18c XE", func() {
 			testCase.instanceSpec.Version = "18c"
 			testCase.instanceSpec.Images = map[string]string{
@@ -272,6 +264,9 @@ var _ = Describe("Instance and Database provisioning", func() {
 					},
 					Images:            map[string]string{},
 					DatabaseResources: dbResource,
+					DBLoadBalancerOptions: &commonv1alpha1.DBLoadBalancerOptions{
+						GCP: commonv1alpha1.DBLoadBalancerOptionsGCP{LoadBalancerType: "Internal"},
+					},
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -284,13 +279,6 @@ var _ = Describe("Instance and Database provisioning", func() {
 			},
 		}
 
-		Context("Oracle 12.2 EE", func() {
-			testCase.instanceSpec.Version = "12.2"
-			testCase.instanceSpec.Images = map[string]string{
-				"service": testhelpers.TestImageForVersion("12.2", "EE", ""),
-			}
-			BackupTest(testCase)
-		})
 		Context("Oracle 18c XE", func() {
 			testCase.instanceSpec.Version = "18c"
 			testCase.instanceSpec.Images = map[string]string{
@@ -328,6 +316,9 @@ var _ = Describe("Instance and Database provisioning", func() {
 					},
 					Images:            map[string]string{},
 					DatabaseResources: dbResource,
+					DBLoadBalancerOptions: &commonv1alpha1.DBLoadBalancerOptions{
+						GCP: commonv1alpha1.DBLoadBalancerOptionsGCP{LoadBalancerType: "Internal"},
+					},
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -338,14 +329,6 @@ var _ = Describe("Instance and Database provisioning", func() {
 				SectionSize: sectionSize,
 			},
 		}
-
-		Context("Oracle 12.2 EE", func() {
-			testCase.instanceSpec.Version = "12.2"
-			testCase.instanceSpec.Images = map[string]string{
-				"service": testhelpers.TestImageForVersion("12.2", "EE", ""),
-			}
-			BackupTest(testCase)
-		})
 
 		Context("Oracle 18c XE", func() {
 			testCase.instanceSpec.Version = "18c"
